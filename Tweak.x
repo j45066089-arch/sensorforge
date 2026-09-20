@@ -1,102 +1,89 @@
 // ============================================================================
-//  SensorForge Pro — Tweak.x
+//  SensorForge Pro — Tweak.x  (v1.1)
 // ----------------------------------------------------------------------------
-//  Eigenstaendiger iOS-System-Tweak (separates, unabhaengiges Paket).
-//  Zielumgebung:    iPhone 8 (iPhone10,4), iOS 16.6 - 16.7.16
-//  Jailbreak:       Dopamine 2 (roothide / rootless, ElleKit)
-//  Zielprozess:     mediaserverd  (= CAPTURE-DAEMON auf iOS 16; hier laufen
-//                   die BW-*-Knoten und der FigCapture-Pfad)
+//  Eigenstaendiger iOS-System-Tweak (mediaserverd, iOS 16.6-16.7.16, roothide).
+//  ZWECK: Downstream-Metadaten-Synthese fuer emulierte Kamera-Feeds.
 //
-//  ZWECK (Hardware-Emulation fuer defekte Kamerasensoren):
-//   Moderne Apps stuerzen ab, wenn Video-Frames ohne valide Sensordaten
-//   ankommen. Dieser Tweak arbeitet deshalb DOWNSTREAM (Post-Processing-
-//   Verfahren): er haengt an bereits existierende Frames ein plausibles,
-//   dynamisches Metadata-Dictionary an. Er liest KEINE Videodateien und
-//   veraendert KEINE Pixel.
+//  NEU IN v1.1:
+//   * Status-Port 8797 (Loopback-TCP, sandbox-freundlich) mit Live-Zaehlern
+//     (emit/synth/pass/pts) — dieser Port BELEGT die Injektion, da NSLog in
+//     mediaserverd gefiltert wird.
+//   * Datei-Lese-Sonde im %ctor: try open() auf die Profil-Pfade und meldet
+//     am Status-Port probeTxt/JPG + errno. Damit messen wir, ob der
+//     sandboxed Daemon die Profil-Datei ueberhaupt LESEN darf.
+//   * Profil-Datei-Support (fallback auf iPhone-8-Defaults):
+//       /var/mobile/Documents/sensorforge_profile.txt
+//       Zeilenformat:  iso=200
+//                      exposure=0.033
+//                      fnumber=1.8
+//                      lens=iPhone 8 Back Camera
+//     Werte ueberschreiben die Basiswerte der Synthese (die dynamische
+//     Fluktuation bleibt erhalten). Damit laesst sich die Ausgabe eines
+//     Host-Rechners/Webservers direkt per Datei einspeisen — sofern die
+//     Sandbox-Sonde Leserechte bestaetigt.
 //
-//  SCHUTZREGELN (Kollisionsfreiheit mit anderen Kamera-Tweaks, z. B. LordVCAM):
-//   * Hook-Ebene maximal downstream: -[BWNodeOutput emitSampleBuffer:]
-//     Zu diesem Zeitpunkt haben Frame-Swap-Tweaks (die z. B. am
-//     BWMultiStreamCameraSourceNode oder an Sink-Knoten haengen und ihren
-//     Austausch %orig-ketten-seitig bereits erledigt haben) ihren Swap
-//     abgeschlossen. Wir ergaenzen danach nur noch fehlende METADATEN.
-//   * KEINE Reallokation: Es wird niemals ein neuer CMSampleBufferRef oder
-//     CVPixelBufferRef erzeugt. Es laufen ausschliesslich in-place
-//     Attachment-Operationen (CMSetAttachment) auf dem bestehenden Buffer.
-//     Damit werden die Speicherbereiche anderer Tweaks nicht verletzt.
-//   * Passthrough: Ein bereits vorhandenes, valides Metadata-Dictionary wird
-//     NICHT angefasst. Nur fehlende oder korrupte Daten werden synthetisiert.
-//
-//  Kern-Schnittstellen (CoreMedia / FigCapture/"Avery"-Graphen):
-//   -------------------------------------------------------------------------
-//   CMSampleBufferRef: Zeit-basierter Container, der Video-BlockBuffer +
-//     FormatDescription + Timing-Info + ATTACHMENTS buendelt.
-//     Attachments liegen am Buffer selbst (via CMSetAttachment) und werden
-//     von AVFoundation unter dem Key kCMSampleBufferAttachmentKey_Metadata-
-//     Dictionary — exakter CFString-Wert: " MetadataDictionary" (fuehrendes
-//     Leerzeichen, kein Tippfehler!) — als NSDictionary gelesen.
-//   CMSetAttachment(): zerstörungsfreies Setzen eines Attachments auf einem
-//     bereits existierenden Buffer — die EINZIGE Mutation, die hier laeuft.
-//   CMSampleBufferSetOutputPresentationTimeStamp(): In-place-Update des
-//     Output-PTS, KEIN neuer Buffer noetig.
-//   CMClockGetTime(CMClockGetHostTimeClock()): Host-Zeitquelle. Aus deren
-//     CMTime wird der neue PTS abgeleitet, damit die PTS-Monotonie erhalten
-//     bleibt (kein A/V-Ruckeln). Der Capture-Pfad taktet ohnehin gegen die
-//     Host-Clock, daher ist das konsistent zum echten Sensor.
-//   BWNodeOutput (Avery-Graph, mediaserverd): letzte gemeinsame Einspeise-
-//     Stufe des BW-Graphen. Proven: emitSampleBuffer: speist Preview,
-//     Foto-Pfad UND Recording — ein Hook hier deckt alle Konsumenten ab.
-//
-//  Logos-OS-Legende: %hook = ObjC-Methode ersetzen, %orig = Original rufen,
-//  %ctor = Konstruktor beim Laden in den Zielprozess.
+//  UNVERAENDERTE SCHUTZREGELN: keine Reallokation (nur CMSetAttachment),
+//  Passthrough bei validen Metadaten, Hook maximal downstream
+//  (BWNodeOutput emitSampleBuffer:).
 // ============================================================================
 
 #import <Foundation/Foundation.h>
-
-// CoreMedia ist ein public SDK-Framework (CoreMedia.framework); die Header
-// liefern die hier genutzten Opaque-Typen und Funktionen:
-//   CMTime / CMClock / CMSampleBuffer / CMAttachment (via <CoreMedia/CoreMedia.h>)
 #include <CoreMedia/CoreMedia.h>
-// ImageIO liefert die EXIF-Schluessel-Konstanten (kCGImagePropertyExif*).
 #include <ImageIO/ImageIO.h>
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <time.h>
+#include <math.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <dispatch/dispatch.h>
 
-// ----------------------------------------------------------------------------
-// EXAKTE Attachment-Keys (so wie AVFoundation sie im Frame liest).
-// Der MetadataDictionary-Key beginnt MIT EINEM LEERZEICHEN — das ist kein
-// Bug, sondern der tatsaechliche CoreMedia-String aus CMFormatDescription.h:
-//   kCMSampleBufferAttachmentKey_MetadataDictionary = CFSTR(" MetadataDictionary")
-// kCMSampleBufferAttachmentKey_MetadataDictionary ist in den iOS-SDK-Headern
-// NICHT sichtbar exportiert -> wir verwenden das CFSTR-Literal direkt.
-// ----------------------------------------------------------------------------
+// --- Attachment-Key ---------------------------------------------------------
+// Exakter CoreMedia-Wert des MetadataDictionary-Keys (fuehrendes Leerzeichen
+// ist kein Tippfehler): kCMSampleBufferAttachmentKey_MetadataDictionary
+// = CFSTR(" MetadataDictionary").
 #define SF_METADATA_KEY       CFSTR(" MetadataDictionary")
 #define SF_EXIF_DICT_KEY      @"{Exif}"
-#define SF_EXIF_DICT_KEY_CF   CFSTR("{Exif}")
 
-// ----------------------------------------------------------------------------
-// iPhone-8-Hardware-Profil (Rueckkamera, A11):
-//   Blende:            f/1.8         (FNumber = 1.8)
-//   Linse:             "iPhone 8 Back Camera"
-//   Basis-ISO:         ~200          (simuliert als Fluktuation 195..205)
-//   Basis-Belichtung:  ~1/30 s       (ExposureTime ~0.033 s, passt zu 30 fps)
-// ----------------------------------------------------------------------------
+// --- iPhone-8-Defaultprofil (gilt, solange keine Profil-Datei da ist) ------
 #define SF_EXIF_LENS_MODEL    @"iPhone 8 Back Camera"
-#define SF_EXIF_FNUMBER       (@1.8)   // NSNumber, ImageIO erwartet Zahl
+#define SF_EXIF_FNUMBER       (@1.8)
 #define SF_ISO_BASE           200
-#define SF_ISO_DELTA          5        // Pendelband +-5 => 195..205
+#define SF_ISO_DELTA          5        // Pendelband => 195..205
 #define SF_EXPOSURE_BASE_S    0.033    // 1/30 s
-#define SF_EXPOSURE_JITTER_S  0.0006   // minimale zeitabhaengige Schwankung
+#define SF_EXPOSURE_JITTER_S  0.0006
+
+// --- Status-Port -----------------------------------------------------------
+#define SF_STATUS_PORT        8797
+
+// --- Konfiguration (von der Profil-Datei ueberschreibbar) -------------------
+static _Atomic(double) g_cfgISO       = SF_ISO_BASE;
+static _Atomic(double) g_cfgExposure  = SF_EXPOSURE_BASE_S;
+static _Atomic(double) g_cfgFNumber   = 1.8;
+static char            g_cfgLens[64]; // einmalig im %ctor geschrieben
+
+// --- Live-Zaehler (Status-Port) ---------------------------------------------
+static _Atomic(uint32_t) g_emitCount  = 0;  // Hook-Aufrufe gesamt (Injektionsbeweis)
+static _Atomic(uint32_t) g_synthCount = 0;  // simulierte Frames
+static _Atomic(uint32_t) g_passCount  = 0;  // Passthrough (valide Metadaten)
+static _Atomic(uint32_t) g_ptsCount   = 0;  // PTS-Updates
+
+// --- Lese-Sonde (Ergebnisse fuer den Status-Port) ---------------------------
+static _Atomic(int) g_probeTxt   = -1;   // 1=lesbar, 0=fehlgeschlagen
+static _Atomic(int) g_probeTxtErrno = 0;
+static _Atomic(int) g_probeJpg   = -1;
+static _Atomic(int) g_probeJpgErrno = 0;
+static _Atomic(int) g_probeVartmp = -1;
+static _Atomic(int) g_probeVartmpErrno = 0;
 
 // ----------------------------------------------------------------------------
-// xorshift32-PRNG. Warum nicht libc rand()?
-//   * Der Hook laeuft mit 30+ fps, teils aus mehreren Konsumenten-Threads.
-//   * rand() hat einen globalen, lockgeschuetzten libc-State — Locking im
-//     Hot-Path eines Capture-Graphen ist tabu.
-//   * xorshift auf einem eigenen _Atomic-Wort ist sperrlos, deterministisch
-//     und billig genug (3 XOR/Shift pro Zahl).
+// xorshift32-PRNG (sperrlos, Hot-Path-tauglich; kein libc-rand-Locking).
 // ----------------------------------------------------------------------------
 static _Atomic(uint32_t) sf_rng_state = 0;
 
@@ -110,18 +97,115 @@ static uint32_t sf_rand_u32(void) {
     return x;
 }
 
-// Float in [lo, hi) — fuer die Sensorfluktuation genau genug.
 static double sf_rand_range(double lo, double hi) {
-    double unit = (double)sf_rand_u32() / 4294967296.0; // [0,1)
+    double unit = (double)sf_rand_u32() / 4294967296.0;
     return lo + unit * (hi - lo);
 }
 
 // ----------------------------------------------------------------------------
-// Validataet: Das (bereits am Buffer haengende) Dictionary gilt als VALIDE,
-// wenn es ein NSDictionary ist und im "{Exif}"-Unter-Dictionary eine FNumber
-// oder ein ISOSpeedRatings-Eintrag existiert. Dann => Passthrough: wir
-// fassen NICHTS an. (Der echte Sensor bzw. andere Tweaks setzen diese
-// Struktur regulaer; fehlt FNumber/ISO, ist das Bild korrupt/unvollstaendig.)
+// Lese-Sonde: darf mediaserverd die Profil-Pfade oeffnen? Ergebnis nur
+// diagnostisch (open + read, kein write).
+// ----------------------------------------------------------------------------
+static void sf_probe_path(const char *path, _Atomic(int) *result,
+                          _Atomic(int) *err) {
+    if (path == NULL) return;
+    int fd = open(path, O_RDONLY);
+    atomic_store_explicit(result, fd >= 0 ? 1 : 0, memory_order_relaxed);
+    atomic_store_explicit(err, fd >= 0 ? 0 : errno, memory_order_relaxed);
+    if (fd >= 0) close(fd);
+}
+
+// ----------------------------------------------------------------------------
+// Profil laden: einfaches Zeilenformat key=value. Fehlen Zeilen oder die
+// Datei, bleiben die iPhone-8-Defaults aktiv.
+// ----------------------------------------------------------------------------
+static void sf_load_profile(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return;
+    char line[160];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *eq = strchr(line, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        char *key = line;
+        // trailing \n/\r entfernen
+        char *val = eq + 1;
+        val[strcspn(val, "\r\n")] = '\0';
+
+        if (strcmp(key, "iso") == 0) {
+            double d = atof(val);
+            if (d >= 25.0 && d <= 6400.0)
+                atomic_store_explicit(&g_cfgISO, d, memory_order_relaxed);
+        } else if (strcmp(key, "exposure") == 0) {
+            double d = atof(val);
+            if (d > 0.0 && d <= 2.0)
+                atomic_store_explicit(&g_cfgExposure, d, memory_order_relaxed);
+        } else if (strcmp(key, "fnumber") == 0) {
+            double d = atof(val);
+            if (d >= 0.5 && d <= 32.0)
+                atomic_store_explicit(&g_cfgFNumber, d, memory_order_relaxed);
+        } else if (strcmp(key, "lens") == 0) {
+            snprintf(g_cfgLens, sizeof(g_cfgLens), "%s", val);
+        }
+    }
+    fclose(f);
+}
+
+// ----------------------------------------------------------------------------
+// Status-Server: Loopback-TCP auf 8797. Jede Verbindung bekommt sofort eine
+// Statuszeile (Send erfolgt direkt nach accept; ein eingehendes Kommando
+// wird ignoriert — Lesen genuegt zum Pollen). Loopback-Bind ist in der
+// mediaserverd-Sandbox erlaubt (geräte-verifiziert im NikeCam-Projekt).
+// ----------------------------------------------------------------------------
+static void sf_status_runloop(void) {
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) return;
+    int one = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(SF_STATUS_PORT);
+
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(srv);
+        return;  // Port belegt? (z. B. zweite Ladung) -> still aufgeben
+    }
+    if (listen(srv, 4) != 0) { close(srv); return; }
+
+    for (;;) {
+        int c = accept(srv, NULL, NULL);
+        if (c < 0) continue;
+
+        char reply[512];
+        snprintf(reply, sizeof(reply),
+            "sforge=1 ver=1.1 "
+            "emit=%u synth=%u pass=%u pts=%u "
+            "probeTxt=%d(%d) probeJpg=%d(%d) probeVartmp=%d(%d) "
+            "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f\n",
+            (unsigned)atomic_load_explicit(&g_emitCount,  memory_order_relaxed),
+            (unsigned)atomic_load_explicit(&g_synthCount, memory_order_relaxed),
+            (unsigned)atomic_load_explicit(&g_passCount,  memory_order_relaxed),
+            (unsigned)atomic_load_explicit(&g_ptsCount,   memory_order_relaxed),
+            atomic_load_explicit(&g_probeTxt,   memory_order_relaxed),
+            atomic_load_explicit(&g_probeTxtErrno, memory_order_relaxed),
+            atomic_load_explicit(&g_probeJpg,   memory_order_relaxed),
+            atomic_load_explicit(&g_probeJpgErrno, memory_order_relaxed),
+            atomic_load_explicit(&g_probeVartmp, memory_order_relaxed),
+            atomic_load_explicit(&g_probeVartmpErrno, memory_order_relaxed),
+            atomic_load_explicit(&g_cfgISO,      memory_order_relaxed),
+            atomic_load_explicit(&g_cfgExposure, memory_order_relaxed),
+            atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed));
+
+        (void)send(c, reply, strlen(reply), 0);
+        close(c);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Validity-Check: Dictionary gilt als valide, wenn "{Exif}".FNumber oder
+// .ISOSpeedRatings existiert => Passthrough.
 // ----------------------------------------------------------------------------
 static BOOL sf_metadata_is_valid(NSDictionary *existing) {
     if (existing == nil || ![existing isKindOfClass:NSDictionary.class]) return NO;
@@ -132,9 +216,7 @@ static BOOL sf_metadata_is_valid(NSDictionary *existing) {
     return NO;
 }
 
-// EXIF-Zeitstempel im exiftool-Format "yyyy:MM:dd HH:mm:ss" — bewusst OHNE
-// NSDateFormatter (teure Allokation pro Frame, nicht threadsicher):
-// localtime_r + snprintf ist Hot-Path-tauglich.
+// EXIF-Zeitstempel ohne NSDateFormatter (Hot-Path-tauglich).
 static NSString *sf_exif_timestamp(void) {
     time_t now = time(NULL);
     struct tm tmv;
@@ -147,158 +229,115 @@ static NSString *sf_exif_timestamp(void) {
 }
 
 // ----------------------------------------------------------------------------
-// Synthese des Exif-Dicts (iPhone-8-Profil, minimal zeitabhaengig):
-//   * FNumber:            fest 1.8
-//   * LensModel:          "iPhone 8 Back Camera"
-//   * ISOSpeedRatings:    NSArray mit einem Wert, Pendeln 195..205
-//   * ExposureTime:       ~1/30 s mit +-0.6 ms Jitter
-//   * DateTimeOriginal:   laufende Systemzeit (exiftool-Format)
-// Die Werte entsprechen bewusst dem echten iPhone-8-Video-Profil, damit
-// App-seitige Auto-Exposure-Logik die Daten als plausibel akzeptiert.
+// EXIF-Synthese: Basiswerte aus Profil-Datei (falls gelesen) sonst
+// iPhone-8-Defaults; darueber die dynamische Sensorfluktuation.
 // ----------------------------------------------------------------------------
 static NSDictionary *sf_build_exif(void) {
+    double isoBase  = atomic_load_explicit(&g_cfgISO, memory_order_relaxed);
+    double expBase  = atomic_load_explicit(&g_cfgExposure, memory_order_relaxed);
+    double fnum     = atomic_load_explicit(&g_cfgFNumber, memory_order_relaxed);
+
+    int iso = (int)llround(isoBase) + (int)sf_rand_range(-SF_ISO_DELTA, SF_ISO_DELTA + 1);
+    if (iso < 25) iso = 25;
+    if (iso > 6400) iso = 6400;
+
+    double exposure = expBase + sf_rand_range(-SF_EXPOSURE_JITTER_S, SF_EXPOSURE_JITTER_S);
+    if (exposure < 0.0005) exposure = 0.0005;
+
     NSMutableDictionary *exif = [NSMutableDictionary dictionaryWithCapacity:5];
-
-    [exif setObject:SF_EXIF_FNUMBER
+    [exif setObject:@(fnum)
              forKey:(NSString *)kCGImagePropertyExifFNumber];
-
-    [exif setObject:SF_EXIF_LENS_MODEL
+    [exif setObject:((g_cfgLens[0] != '\0')
+                        ? [NSString stringWithUTF8String:g_cfgLens]
+                        : SF_EXIF_LENS_MODEL)
              forKey:(NSString *)kCGImagePropertyExifLensModel];
-
-    int iso = SF_ISO_BASE + (int)sf_rand_range(-SF_ISO_DELTA, SF_ISO_DELTA + 1);
     [exif setObject:@[ @(iso) ]
              forKey:(NSString *)kCGImagePropertyExifISOSpeedRatings];
-
-    double exposure = SF_EXPOSURE_BASE_S
-                    + sf_rand_range(-SF_EXPOSURE_JITTER_S, SF_EXPOSURE_JITTER_S);
     [exif setObject:@(exposure)
              forKey:(NSString *)kCGImagePropertyExifExposureTime];
-
-    // Datum/Zeit nur ca. 1x pro Sekunde neu (Sekundengenauigkeit): billig.
     [exif setObject:sf_exif_timestamp()
              forKey:(NSString *)kCGImagePropertyExifDateTimeOriginal];
-
     return exif;
 }
 
 // ----------------------------------------------------------------------------
-// PTS-Aktualisierung: In-place via CMSampleBufferSetOutputPresentation-
-// TimeStamp. Zeitbasis = Host-Uhr (CMClockGetTime(CMClockGetHostTimeClock())),
-// also der Takt, gegen den der Capture-Pfad ohnehin laeuft. Monotonie-Guard:
-// der neue PTS faellt nie hinter den alten zurueck (Decodern/Demuxern wird
-// so kein Ruecksprung zugemutet => kein Ruckeln).
+// PTS in-place auf Host-Takt setzen (monoton nach vorne).
 // ----------------------------------------------------------------------------
 static void sf_update_pts(CMSampleBufferRef buf) {
     if (buf == NULL) return;
-
     CMTime hostTime = CMClockGetTime(CMClockGetHostTimeClock());
     CMTime oldPts   = CMSampleBufferGetOutputPresentationTimeStamp(buf);
     CMTime newPts   = hostTime;
-
-    // Wenn der Host-Takt (warum auch immer) hinter dem Frame-PTS haenge:
-    // alten PTS um ein Minimum nach vorne schieben statt zurueckzuspringen.
-    // Timescale 1.000.000 (Mikrosekunden) => 0.1 ms bleiben darstellbar.
     if (CMTIME_IS_VALID(oldPts) && CMTimeCompare(hostTime, oldPts) < 0) {
         newPts = CMTimeAdd(oldPts, CMTimeMakeWithSeconds(0.0001, 1000000));
     }
-
     if (CMTIME_IS_VALID(newPts)) {
         CMSampleBufferSetOutputPresentationTimeStamp(buf, newPts);
+        atomic_fetch_add_explicit(&g_ptsCount, 1, memory_order_relaxed);
     }
 }
 
 // ============================================================================
-// HOOK — maximale Downstream-Stufe im mediaserverd-Capture-Pfad.
-//
-// Warum -[BWNodeOutput emitSampleBuffer:]?
-//   * BWNodeOutput ist die letzte gemeinsame Ausgabe-Stufe der BW-Graphen
-//     (Avery/FigCapture): Preview, Still und Movie-Recording fliessen HIER
-//     hindurch. Ein einziger Hook deckt alle Konsumenten ab.
-//   * Frame-Swap-Tweaks (LordVCAM etc.) tauschen ihre Pixel ebenfalls in
-//     dieser Kette bzw. frueher im Graphen. Attachments (diese Dylib) und
-//     Pixel-Bytes (andere Tweaks) liegen auf getrennten Lanes desselben
-//     Buffer-Objekts — ein reines Content-Add-on, das mit jedem Swap-Tweak
-//     koexistiert, solange wir weder Buffer noch Pixel neu alloziieren.
-//
-// Ablauf im Hook:
-//   (1) Guard: kein NULL-Buffer.
-//   (2) Passthrough-Check: valides Metadata-Dictionary am Buffer => Finger
-//       weg, es wird NICHTS veraendert (weder Dictionary noch PTS).
-//   (3) Simulation: nur bei fehlenden/korrupten Metadaten -> Exif-Dictionary
-//       bauen, per CMSetAttachment (in-place!) anhaengen, PTS auf Host-Takt.
-//   (4) %orig ganz am Ende: Die Anreicherung passiert VOR dem Originalpfad,
-//       damit alle nachgelagerten Konsumenten den Frame MIT den Attachments
-//       erhalten. (Wuerde man %orig zuerst rufen, haette der Original-Emit
-//       den Buffer schon ohne Metadaten weitergereicht.)
-//
-// BWNodeOutput ist eine PRIVATE Klasse — Logos loest sie zur Laufzeit ueber
-// den Klassen-Namen auf, es werden keine privaten Header benoetigt.
+// HOOK — maximale Downstream-Stufe (BWNodeOutput emitSampleBuffer:).
+// Logos-Pitfall: id in der Signatur, CMSampleBufferRef erst im Body.
 // ============================================================================
-
 %hook BWNodeOutput
 
-// Logos-Pitfall (geräte-verifiziert): opaque C-Pointer NICHT in die
-// Hook-Signatur legen — der generierte Wrapper erwartet ein ObjC-`id`.
-// Deshalb hier `id`, Bridge zu CMSampleBufferRef erst IM Body, und %orig
-// bekommt exakt die `id`-Variable.
 - (void)emitSampleBuffer:(id)sampleBuffer {
+    atomic_fetch_add_explicit(&g_emitCount, 1, memory_order_relaxed);
+
     if (sampleBuffer != nil) {
         CMSampleBufferRef sb = (__bridge CMSampleBufferRef)sampleBuffer;
-
-        // (1) TypeGuard: nur echte SampleBuffer anfassen (der Graph ruft
-        //     diese Methode nur mit CMSampleBufferRef auf, aber ein
-        //     fehlerhafter Downstream-Tweak koennte den Parameter umbiegen).
         if (sb != NULL && CFGetTypeID(sb) == CMSampleBufferGetTypeID()) {
 
-            // (2) Passthrough bei validen, bereits vorhandenen Metadaten.
-            //     CMGetAttachment liest NUR den Attachments-Slot (keine
-            //     Kopie, keine Allokation).
-            CFTypeRef existingRef = CMGetAttachment(sb,
-                                                    SF_METADATA_KEY,
-                                                    NULL);
+            CFTypeRef existingRef = CMGetAttachment(sb, SF_METADATA_KEY, NULL);
             NSDictionary *existing = (__bridge NSDictionary *)existingRef;
 
-            if (!sf_metadata_is_valid(existing)) {
-
-                // (3) Synthese + zerstörungsfreies Anhaengen am BESTEHENDEN
-                //     Buffer. KEINE Reallokation, kein neuer CMSampleBufferRef,
-                //     kein neuer CVPixelBufferRef — nur der Attachments-Slot
-                //     wird gesetzt (kCMAttachmentMode_ShouldPropagate = 1,
-                //     liest AVFoundation genauso zurueck).
+            if (sf_metadata_is_valid(existing)) {
+                atomic_fetch_add_explicit(&g_passCount, 1, memory_order_relaxed);
+            } else {
                 NSDictionary *exif = sf_build_exif();
                 NSDictionary *meta = @{ SF_EXIF_DICT_KEY : exif };
-
-                CMSetAttachment(sb,
-                                SF_METADATA_KEY,
+                CMSetAttachment(sb, SF_METADATA_KEY,
                                 (__bridge CFTypeRef)meta,
                                 kCMAttachmentMode_ShouldPropagate);
-
-                // PTS nur im Simulationsfall anfassen (kein Eingriff in
-                // echte, gesunde Feeds).
                 sf_update_pts(sb);
+                atomic_fetch_add_explicit(&g_synthCount, 1, memory_order_relaxed);
             }
-            // -> valide Metadaten: kompletter Passthrough, nichts passiert.
         }
     }
-
-    // (4) Original-Emit mit dem (ggf. angereicherten) Buffer.
     %orig;
 }
 
 %end
 
 // ============================================================================
-// Konstruktor: RNG-Seed aus mach_absolute_time (Monotonic-High-Res-Takt,
-// billiger als time(NULL) und nicht wall-clock-abhaengig).
-// Hinweis zur Diagnose: os_log/NSLog wird in mediaserverd teils gefiltert —
-// Geladen-Nachweis auf dem Geraet am besten host-seitig via syslog-Capture
-// (idevicesyslog.exe) pruefen.
+// %ctor: Defaults setzen, Lese-Sonde starten, Profil laden, Status-Server
+// starten. Reihenfolge bewusst: erst Sonde+Profil (einmalig), dann Server.
 // ============================================================================
 %ctor {
     uint32_t seed = (uint32_t)(mach_absolute_time() & 0xFFFFFFFFU);
     if (seed == 0) seed = 0x2545F491U;
     atomic_store_explicit(&sf_rng_state, seed | 1U, memory_order_relaxed);
 
-    NSLog(@"[SensorForgePro] loaded in %@ — downstream metadata synth (iPhone 8 profile, passthrough bei validen Metadaten)",
-          [[NSProcessInfo processInfo] processName]);
+    snprintf(g_cfgLens, sizeof(g_cfgLens), "%s", "");
+
+    // Lese-Sonde: vorhandene Dateien? Sonde misst Lesbarkeit in mediaserverd.
+    sf_probe_path("/var/mobile/Documents/sensorforge_profile.txt",
+                  &g_probeTxt, &g_probeTxtErrno);
+    sf_probe_path("/var/mobile/Documents/sensorforge_profile.jpg",
+                  &g_probeJpg, &g_probeJpgErrno);
+    sf_probe_path("/var/tmp/sensorforge_profile.txt",
+                  &g_probeVartmp, &g_probeVartmpErrno);
+
+    // Profil laden (falls lesbar) — ueberschreibt die Defaults.
+    sf_load_profile("/var/mobile/Documents/sensorforge_profile.txt");
+
+    // Status-Server auf Utility-Queue (blockiert nie den Hauptpfad).
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        sf_status_runloop();
+    });
+
+    NSLog(@"[SensorForgePro] v1.1 loaded in %@ — status port %d, profile+probe aktiv",
+          [[NSProcessInfo processInfo] processName], SF_STATUS_PORT);
 }
