@@ -141,6 +141,57 @@ def parse_exif_jpeg(path):
     return out
 
 
+def build_test_jpeg_with_exif(path):
+    """Erzeugt eine kleine JPEG mit EXIF (ISO 320, 1/50s, f/2.2) — nur fr
+    lokale Tests des Parsers/Links. TIFF wird programmatisch aufgebaut."""
+    import base64
+    tiny = base64.b64decode(
+        "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
+        "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA"
+        "/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==")
+
+    # TIFF little-endian aufbauen: Header (8) + IFD mit 3 Entries + Datenblock.
+    n_entries = 3
+    entries = []
+    data = bytearray()
+
+    def add_entry(tag, typ, count, value_bytes):
+        """value_bytes <= 4: inline ins Value-Feld; sonst Offset in den Block."""
+        nonlocal data, entries, n_entries
+        if len(value_bytes) <= 4:
+            padded = value_bytes + b"\x00" * (4 - len(value_bytes))
+            entries.append((tag, typ, count, None, padded))
+            return
+        while len(data) % 2:
+            data.append(0)
+        # Datenblock beginnt NACH dem kompletten IFD: 8 Header + 2 count
+        # + n_entries*12 + 4 next-IFD.
+        off = 8 + 2 + n_entries * 12 + 4 + len(data)
+        data += value_bytes
+        entries.append((tag, typ, count, off, None))
+
+    add_entry(0x829D, 5, 1, (22).to_bytes(4, "little") + (10).to_bytes(4, "little"))  # f/2.2
+    add_entry(0x829A, 5, 1, (1).to_bytes(4, "little") + (50).to_bytes(4, "little"))   # 1/50s
+    add_entry(0x8827, 3, 1, (320).to_bytes(2, "little"))                              # ISO 320
+
+    tiff = bytearray()
+    tiff += b"II" + (42).to_bytes(2, "little") + (8).to_bytes(4, "little")
+    tiff += n_entries.to_bytes(2, "little")
+    for tag, typ, count, off, inline in entries:
+        tiff += tag.to_bytes(2, "little")
+        tiff += typ.to_bytes(2, "little")
+        tiff += count.to_bytes(4, "little")
+        tiff += inline if inline is not None else off.to_bytes(4, "little")
+    tiff += (0).to_bytes(4, "little")               # next IFD = 0
+    tiff += data
+
+    app1 = b"\xff\xe1" + (2 + 6 + len(tiff)).to_bytes(2, "big") + b"Exif\x00\x00" + bytes(tiff)
+    out = b"\xff\xd8" + app1 + tiny[2:]
+    with open(path, "wb") as f:
+        f.write(out)
+    return path
+
+
 def video_luma_stats(path, framecap):
     """Mittlere Y-Luminanz eines Frames via ffmpeg -> rawvideo yuv420p."""
     cmd = [

@@ -449,52 +449,87 @@ static double sf_compute_lux(int iso, double exposure, double fnum) {
 }
 
 // ----------------------------------------------------------------------------
-// MakerApple-Synthese (v1.4): numerische Apple-MakerNote-Tags.
-// Basis: Immobilisierung der ECHTEN Tags erfolgt live via keys? (echte
-// Frames dumpfen ihre Key-Namen). Hier die Apple-Dokumentation der
-// haeufigsten: 1 LuxLevel, 2 AEStable, 3 AETarget, 4 AEAverage, 5 AFStable,
-// 7 AFMode(2=continuous)*, 8 AGC, 9 DGain, 10 ispDGain(256-basiert),
-// 13 focusPosition(0..1), 15 DigitalFlash.
+// ECHTE Apple-MakerNote-Tags (v1.5, Beleg: ExifTool-TagNames/Apple.html).
+// Nummern-Schema hexadezimal, ein "14" ersetzt den (den Tweak verratenden)
+// String-Namen 0x0001/MakerNoteVersion — wir nennen ihn bewusst NICHT.
+//  0x0004 AEStable (0/1)         0x0005 AETarget
+//  0x0006 AEAverage              0x0007 AFStable (0/1)
+//  0x0008 AccelerationVector[3]  0x0014 ImageCaptureType (10=Photo)
+//  0x0017 LivePhotoVideoIndex    0x001d LuminanceNoiseAmplitude
+//  0x0027 SignalToNoiseRatio     0x002c DeviceUserDistance
+//  0x002d ColorTemperature       0x002e CameraType (0=Back Wide Angle)
+//  0x002f FocusPosition          0x0030 HDRGain
+//  0x0038 AFMeasuredDepth        0x003d AFConfidence
+//  0x003e ColorCorrectionMatrix
 // ----------------------------------------------------------------------------
-static NSDictionary *sf_build_maker(int iso, double exposure, double fnum) {
-    double lux = sf_compute_lux(iso, exposure, fnum);
-    double agc = SF_EXPOSURE_BASE_S / (exposure > 0.0005 ? exposure : 0.0005);
+static NSDictionary *sf_build_makernote(int iso, double exposure, double lux,
+                                        double lensPos, double agc, int digFlash) {
 
-    // ispDGain: 256 = 1.0x. Apple laesst den ISP-Gain mit dem AGC mitlaufen;
-    // fehlt dieses Feld, ist der Frame nachweislich nie durch die physische
-    // Linse gegangen.
+    double snr = 3.0 + (agc - 1.0) * 1.6 + sf_rand_range(-0.2, 0.2); // Gain -> SNR faellt
+    if (snr < 0.5) snr = 0.5;
+
+    NSMutableDictionary *m = [NSMutableDictionary dictionaryWithCapacity:15];
+    [m setObject:@14 forKey:@"1"];                                       // Tag 0x0001 (Version)
+    [m setObject:@((sf_rand_u32() % 100) < 92 ? 1 : 0) forKey:@"4"];     // AEStable
+    [m setObject:@((int)llround(lux * 0.8)) forKey:@"5"];                // AETarget
+    [m setObject:@((int)sf_rand_range(110.0, 190.0)) forKey:@"6"];       // AEAverage
+    [m setObject:@1 forKey:@"7"];                                        // AFStable
+    [m setObject:@10 forKey:@"20"];                                      // 0x0014 ImageCaptureType=10
+    [m setObject:@0 forKey:@"23"];                                       // 0x0017 LivePhotoVideoIndex
+    [m setObject:@((double)sf_rand_range(0.20, 0.35)) forKey:@"29"];     // 0x001d LuminanceNoiseAmplitude
+    [m setObject:@(snr) forKey:@"39"];                                   // 0x0027 SignalToNoiseRatio
+    [m setObject:@((int)sf_rand_range(55, 70)) forKey:@"44"];            // 0x002c DeviceUserDistance
+    [m setObject:@((int)sf_rand_range(4700, 5200)) forKey:@"45"];        // 0x002d ColorTemperature
+    [m setObject:@0 forKey:@"46"];                                       // 0x002e CameraType (Back Wide)
+    [m setObject:@((int)llround(lensPos * 1000.0)) forKey:@"47"];        // 0x002f FocusPosition
+    [m setObject:@(1.0 + sf_rand_range(-0.02, 0.02)) forKey:@"48"];      // 0x0030 HDRGain
+    [m setObject:@((int)sf_rand_range(95, 125)) forKey:@"56"];           // 0x0038 AFMeasuredDepth
+    [m setObject:@((int)sf_rand_range(70, 110)) forKey:@"61"];           // 0x003d AFConfidence
+    return m;
+}
+
+// ----------------------------------------------------------------------------
+// Video-Frame-Dictionary (v1.5): die STRING-Keys, die AVFoundation live am
+// Frame liest. Das ist die "ISP-Signatur"-Schicht fuer Video — fehlen diese,
+// weiss die Gegenseite sofort, dass der Frame nie durch eine Apple-ISP-
+// Pipeline ging:
+//   LuxLevel:         Umgebungslicht, muss mit ISO*Exposure korrelieren
+//                     (Fotometrie: Lux = 250*F^2/(ISO*t))
+//   ispDGain:         ISP-Digital-Gain (256-basiert). IMMER vorhanden.
+//   DigitalFlash:     kurzer Hardware-Flash-Indikator
+//   LensPosition:     Fokustrieb 0..1 — "mikroskopischer" AF-Beweis
+//   FocusConfidence, FocusMode, snr, luma ve_runden das Bild ab.
+// ----------------------------------------------------------------------------
+static NSDictionary *sf_build_videometa(int iso, double exposure, double lux,
+                                        double lensPos, double agc, int digFlash) {
     int ispdg = 256 + (int)llround((agc - 1.0) * 220.0);
     if (ispdg < 256) ispdg = 256;
     if (ispdg > 2048) ispdg = 2048;
     ispdg += (int)sf_rand_range(-4.0, 5.0);
 
-    double lensPos = sf_walk_lenspos();
-    int digFlash   = atomic_load_explicit(&g_cfgFlash, memory_order_relaxed) ? 1 : 0;
-    int aeStable   = (sf_rand_u32() % 100) < 92 ? 1 : 0;   // selten kurzer AEC-Einbruch
-
-    NSMutableDictionary *m = [NSMutableDictionary dictionaryWithCapacity:11];
-    [m setObject:@((int)llround(lux))      forKey:@1];   // LuxLevel
-    [m setObject:@(aeStable)               forKey:@2];   // AEStable
-    [m setObject:@((int)llround(lux * 0.8)) forKey:@3];  // AETarget
-    [m setObject:@((int)sf_rand_range(110.0, 190.0)) forKey:@4]; // AEAverage
-    [m setObject:@1                        forKey:@5];   // AFStable
-    [m setObject:@2                        forKey:@7];   // AFMode: continuous (Video)
-    [m setObject:@(agc)                    forKey:@8];   // AGC (1.0 bei 1/30 s)
-    [m setObject:@(1.0 + sf_rand_range(-0.03, 0.03)) forKey:@9]; // DGain
-    [m setObject:@(ispdg)                  forKey:@10];  // ispDGain
-    [m setObject:@(lensPos)                forKey:@13];  // focusPosition
-    [m setObject:@(digFlash)               forKey:@15];  // DigitalFlash
-    return m;
+    NSMutableDictionary *v = [NSMutableDictionary dictionaryWithCapacity:8];
+    [v setObject:@((double)llround(lux * 100.0) / 100.0)  forKey:@"LuxLevel"];
+    [v setObject:@(ispdg)                                 forKey:@"ispDGain"];
+    [v setObject:@(digFlash)                              forKey:@"DigitalFlash"];
+    [v setObject:@(lensPos)                               forKey:@"LensPosition"];
+    [v setObject:@((int)sf_rand_range(70, 110))           forKey:@"FocusConfidence"];
+    [v setObject:@((int)sf_rand_range(60, 110))           forKey:@"FocusDistance"];
+    [v setObject:@(agc)                                   forKey:@"AGC"];
+    [v setObject:@(1.0 + sf_rand_range(-0.05, 0.05))      forKey:@"DGain"];
+    return v;
 }
 
 // ----------------------------------------------------------------------------
-// EXIF-Synthese: Basis + Random-Walk.
+// Gesamt-Metadata (v1.5): {Exif} + {MakerApple} + Video-String-Keys.
 // ----------------------------------------------------------------------------
-static NSDictionary *sf_build_exif(void) {
+static NSDictionary *sf_build_meta(void) {
     double fnum     = atomic_load_explicit(&g_cfgFNumber, memory_order_relaxed);
-
-    int iso         = sf_walk_iso();
+    int    iso      = sf_walk_iso();
     double exposure = sf_walk_exposure();
+    double lensPos  = sf_walk_lenspos();
+    double lux      = sf_compute_lux(iso, exposure, fnum);
+    double agc      = SF_EXPOSURE_BASE_S / (exposure > 0.0005 ? exposure : 0.0005);
+    int    digFlash = atomic_load_explicit(&g_cfgFlash, memory_order_relaxed) ? 1 : 0;
 
     NSMutableDictionary *exif = [NSMutableDictionary dictionaryWithCapacity:5];
     [exif setObject:@(fnum)
@@ -509,7 +544,15 @@ static NSDictionary *sf_build_exif(void) {
              forKey:(NSString *)kCGImagePropertyExifExposureTime];
     [exif setObject:sf_exif_timestamp()
              forKey:(NSString *)kCGImagePropertyExifDateTimeOriginal];
-    return exif;
+
+    NSDictionary *maker     = sf_build_makernote(iso, exposure, lux, lensPos, agc, digFlash);
+    NSDictionary *videometa = sf_build_videometa(iso, exposure, lux, lensPos, agc, digFlash);
+
+    NSMutableDictionary *meta = [NSMutableDictionary dictionaryWithCapacity:8];
+    [meta setObject:exif      forKey:SF_EXIF_DICT_KEY];
+    [meta setObject:maker     forKey:@"{MakerApple}"];
+    [meta addEntriesFromDictionary:videometa];
+    return meta;
 }
 
 // ----------------------------------------------------------------------------
@@ -554,16 +597,8 @@ static void sf_update_pts(CMSampleBufferRef buf) {
                 // VOR der Synthese abgreifen, was (ggf. partiell) am Frame
                 // haengt: DAS ist die echte Apple/Original-Signatur.
                 sf_maybe_dump_keys(existing, 0);
-                // Synthese: {Exif} + {MakerApple} Nummern-Tags.
-                NSDictionary *exif    = sf_build_exif();
-                int     iso           = atomic_load_explicit(&g_lastISO,     memory_order_relaxed);
-                double  exposure      = atomic_load_explicit(&g_lastExposure,memory_order_relaxed);
-                double  fnum          = atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed);
-                if (exposure < 0.0005) exposure = 0.0005;
-
-                NSDictionary *maker = sf_build_maker(iso, exposure, fnum);
-                NSDictionary *meta = @{ SF_EXIF_DICT_KEY : exif,
-                                        @"{MakerApple}"    : maker };
+                // Synthese: {Exif} + {MakerApple} + Video-String-Keys.
+                NSDictionary *meta = sf_build_meta();
 
                 CMSetAttachment(sb, SF_METADATA_KEY,
                                 (__bridge CFTypeRef)meta,

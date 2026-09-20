@@ -1,0 +1,5 @@
+;FFMETADATA1
+minor_version=512\;0
+major_brand=isom\;heic
+compatible_brands=isomiso2mp41\;mif1MiPrmiafMiHBheic
+encoder=Lavf63.1.101
