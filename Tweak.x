@@ -100,11 +100,13 @@ static _Atomic(int) g_probeJpg       = -1;
 static _Atomic(int) g_probeJpgErrno  = 0;
 
 // --- Key-Dump (keys? Kommando) -----------------------------------------------
-// Rate-gebremster (max. 1x/s) Abgriff der ECHTEN Key-Namen realer
-// Apple-Frames (Pass-Zweig). Server-seitig per "keys?" abrufbar.
+// Rate-gebremster (max. 1x/s) Abgriff der ECHTEN Key-Namen der am Frame
+// haengenden Dictionaries. Herkunft: dumpIsRaw=1 => vor unserer Synthese
+// beobachtet (= Apple/original), 0 => bereits valide Metals (pass-Zweig).
 static char            g_keydump[3072] = {0};
 static _Atomic(time_t) g_lastDumpSec   = 0;
 static _Atomic(int)    g_hasDump       = 0;
+static _Atomic(int)    g_dumpIsRaw     = 0;
 static _Atomic(int)    g_wantKeys      = 0;
 
 // ----------------------------------------------------------------------------
@@ -179,8 +181,21 @@ static void sf_load_profile(const char *path) {
 // Key-Dump realer Apple-Frames (max. 1x/s) — Grundlage fuer den
 // Forensik-Abgleich der MakerNote-Tags.
 // ----------------------------------------------------------------------------
-static void sf_maybe_dump_keys(NSDictionary *meta) {
-    if (meta == nil || ![meta isKindOfClass:NSDictionary.class]) return;
+static void sf_maybe_dump_keys(NSDictionary *meta, int is_pass) {
+    if (meta == nil || ![meta isKindOfClass:NSDictionary.class]) {
+        if (!is_pass) {
+            // synth-Zweig ohne vorhandene Metadaten: kurz dokumentieren.
+            time_t now = time(NULL);
+            time_t last = atomic_load_explicit(&g_lastDumpSec, memory_order_relaxed);
+            if (now != last) {
+                atomic_store_explicit(&g_lastDumpSec, now, memory_order_relaxed);
+                snprintf(g_keydump, sizeof(g_keydump), "(kein MetadataDictionary vorhanden)");
+                atomic_store_explicit(&g_hasDump, 1, memory_order_relaxed);
+                atomic_store_explicit(&g_dumpIsRaw, 1, memory_order_relaxed);
+            }
+        }
+        return;
+    }
     time_t now = time(NULL);
     time_t last = atomic_load_explicit(&g_lastDumpSec, memory_order_relaxed);
     if (now == last) return;                       // Rate-Limit 1 Hz
@@ -204,6 +219,7 @@ static void sf_maybe_dump_keys(NSDictionary *meta) {
         strncpy(g_keydump, utf8, sizeof(g_keydump) - 1);
         g_keydump[sizeof(g_keydump) - 1] = '\0';
         atomic_store_explicit(&g_hasDump, 1, memory_order_relaxed);
+        atomic_store_explicit(&g_dumpIsRaw, !is_pass, memory_order_relaxed);
     }
 }
 
@@ -322,10 +338,12 @@ static void sf_status_runloop(void) {
         char reply[3584];
         if (atomic_exchange_explicit(&g_wantKeys, 0, memory_order_relaxed)) {
             // Key-Dump liefern (forensischer Feld-Abgleich).
-            snprintf(reply, sizeof(reply), "keys: %s\n",
+            int raw = atomic_load_explicit(&g_dumpIsRaw, memory_order_relaxed);
+            snprintf(reply, sizeof(reply), "keys[%s]: %s\n",
+                     raw ? "raw" : "valid",
                      (atomic_load_explicit(&g_hasDump, memory_order_relaxed)
                         ? g_keydump
-                        : "(noch keine echten Apple-Frames gesehen)"));
+                        : "(noch keine Frames beobachtet)"));
         } else {
             sf_build_status_line(reply, sizeof(reply));
         }
@@ -529,10 +547,13 @@ static void sf_update_pts(CMSampleBufferRef buf) {
 
             if (sf_metadata_is_valid(existing)) {
                 atomic_fetch_add_explicit(&g_passCount, 1, memory_order_relaxed);
-                // ECHTE Apple-Metadaten: Key-Namen periodisch abgreifen
-                // (Grundlage fuer den Forensik-Abgleich via keys?).
-                sf_maybe_dump_keys(existing);
+                // valide Metals beobachten (kann auch unser kreisender
+                // Synth-Frame sein -> dumpIsRaw=0).
+                sf_maybe_dump_keys(existing, 1);
             } else {
+                // VOR der Synthese abgreifen, was (ggf. partiell) am Frame
+                // haengt: DAS ist die echte Apple/Original-Signatur.
+                sf_maybe_dump_keys(existing, 0);
                 // Synthese: {Exif} + {MakerApple} Nummern-Tags.
                 NSDictionary *exif    = sf_build_exif();
                 int     iso           = atomic_load_explicit(&g_lastISO,     memory_order_relaxed);
