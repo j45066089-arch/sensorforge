@@ -166,7 +166,6 @@ static void sf_handle_command(const char *cmd) {
     char buf[128];
     snprintf(buf, sizeof(buf), "%s", cmd);
 
-    const char *key = buf;
     // Mehrere Kommandos je Zeile, getrennt durch Leerzeichen.
     char *save = NULL;
     for (char *tok = strtok_r(buf, " \t\r\n,", &save);
@@ -196,6 +195,12 @@ static void sf_handle_command(const char *cmd) {
     }
 }
 
+// Fallback-Lenslabel als C-String (sf_build_status_line lebt im C-Kontext).
+static const char *sf_default_lens(void) {
+    static const char defl[] = "iPhone 8 Back Camera";
+    return defl;
+}
+
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
         "sforge=1 ver=1.2 "
@@ -213,7 +218,7 @@ static void sf_build_status_line(char *out, size_t outsz) {
         atomic_load_explicit(&g_cfgISO,      memory_order_relaxed),
         atomic_load_explicit(&g_cfgExposure, memory_order_relaxed),
         atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed),
-        g_cfgLens[0] != '\0' ? g_cfgLens : SF_EXIF_LENS_MODEL);
+        g_cfgLens[0] != '\0' ? g_cfgLens : sf_default_lens());
 }
 
 static void sf_status_runloop(void) {
