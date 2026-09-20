@@ -62,11 +62,20 @@
 // --- Status-Port -----------------------------------------------------------
 #define SF_STATUS_PORT        8797
 
-// --- Konfiguration (von der Profil-Datei ueberschreibbar) -------------------
+// --- Konfiguration (von der Profil-Datei/Kommandoport ueberschreibbar) ------
 static _Atomic(double) g_cfgISO       = SF_ISO_BASE;
 static _Atomic(double) g_cfgExposure  = SF_EXPOSURE_BASE_S;
 static _Atomic(double) g_cfgFNumber   = 1.8;
 static char            g_cfgLens[64]; // einmalig im %ctor geschrieben
+
+// --- Random-Walk-State (v1.3): statt reinem Jitter ein zeitabhaengiger Walk
+//     mit Rueckstellkraft zur Basis — so pendelt der "Sensor" wie ein echter
+//     AEC-Loop um den Arbeitspunkt.
+static _Atomic(double) g_walkISO      = SF_ISO_BASE;
+static _Atomic(double) g_walkExposure = SF_EXPOSURE_BASE_S;
+// Letzte publizierte Werte (Statuszeile => Walk sichtbar).
+static _Atomic(int)    g_lastISO      = SF_ISO_BASE;
+static _Atomic(double) g_lastExposure = SF_EXPOSURE_BASE_S;
 
 // --- Live-Zaehler (Status-Port) ---------------------------------------------
 static _Atomic(uint32_t) g_emitCount  = 0;  // Hook-Aufrufe gesamt (Injektionsbeweis)
@@ -203,10 +212,11 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.2 "
+        "sforge=1 ver=1.3 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
-        "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s\n",
+        "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
+        "walkIso=%d walkExposure=%.4f\n",
         (unsigned)atomic_load_explicit(&g_emitCount,  memory_order_relaxed),
         (unsigned)atomic_load_explicit(&g_synthCount, memory_order_relaxed),
         (unsigned)atomic_load_explicit(&g_passCount,  memory_order_relaxed),
@@ -218,7 +228,9 @@ static void sf_build_status_line(char *out, size_t outsz) {
         atomic_load_explicit(&g_cfgISO,      memory_order_relaxed),
         atomic_load_explicit(&g_cfgExposure, memory_order_relaxed),
         atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed),
-        g_cfgLens[0] != '\0' ? g_cfgLens : sf_default_lens());
+        g_cfgLens[0] != '\0' ? g_cfgLens : sf_default_lens(),
+        atomic_load_explicit(&g_lastISO,     memory_order_relaxed),
+        atomic_load_explicit(&g_lastExposure, memory_order_relaxed));
 }
 
 static void sf_status_runloop(void) {
@@ -288,20 +300,79 @@ static NSString *sf_exif_timestamp(void) {
 }
 
 // ----------------------------------------------------------------------------
+// Random-Walk (v1.3): kleiner Schritt pro Aufruf + schwache Rueckstellkraft
+// zum Arbeitspunkt. Deckel = das Pendelband des Profils, damit der Wert nie
+// ausreist. Ergebnis: natuerliche AEC-artige Fluktuation statt weissen
+// Rauschens.
+// ----------------------------------------------------------------------------
+static int sf_walk_iso(void) {
+    double cur  = atomic_load_explicit(&g_walkISO, memory_order_relaxed);
+    double base = atomic_load_explicit(&g_cfgISO, memory_order_relaxed);
+
+    // Schritt: 0..1.5 ISO pro Frame-Zyklus + 3% Rueckstellkraft zur Mitte.
+    double step = sf_rand_range(-1.5, 1.5) + (base - cur) * 0.03;
+    cur += step;
+    if (cur < base - SF_ISO_DELTA) cur = base - SF_ISO_DELTA;
+    if (cur > base + SF_ISO_DELTA) cur = base + SF_ISO_DELTA;
+
+    atomic_store_explicit(&g_walkISO, cur, memory_order_relaxed);
+    int iso = (int)llround(cur);
+    if (iso < 25) iso = 25;
+    atomic_store_explicit(&g_lastISO, iso, memory_order_relaxed);
+    return iso;
+}
+
+static double sf_walk_exposure(void) {
+    double cur  = atomic_load_explicit(&g_walkExposure, memory_order_relaxed);
+    double base = atomic_load_explicit(&g_cfgExposure, memory_order_relaxed);
+
+    // Schritt in Sekunden: ~+-0.3 ms + Rueckstellkraft; Deckel +-3%.
+    double step = sf_rand_range(-0.0003, 0.0003) + (base - cur) * 0.03;
+    cur += step;
+    if (cur < base * 0.97) cur = base * 0.97;
+    if (cur > base * 1.03) cur = base * 1.03;
+    if (cur < 0.0005) cur = 0.0005;
+
+    atomic_store_explicit(&g_walkExposure, cur, memory_order_relaxed);
+    atomic_store_explicit(&g_lastExposure, cur, memory_order_relaxed);
+    return cur;
+}
+
+// ----------------------------------------------------------------------------
+// MakerApple-Synthese (v1.3): Apple-typische Sensorfelder, die moderne Apps
+// und EXIF-Tools neben "{Exif}" erwarten. Klein und plausibel gehalten;
+// echte Frames fuehren ~34 Felder — die hier genannten sind die haeufig
+// geprueften (AEStable/AFStable/AEAverage/AGC/DGain).
+// Analog-Gain (AGC) aus dem Belichtungsverhaeltnis zur 1/30-s-Norm.
+// ----------------------------------------------------------------------------
+static NSDictionary *sf_build_maker(double exposure) {
+    NSMutableDictionary *maker = [NSMutableDictionary dictionaryWithCapacity:6];
+
+    // ueberwiegend stabil, selten kurzer Sprung (AEC reagiert).
+    [maker setObject:@((sf_rand_u32() % 100) < 92 ? 1 : 0)
+              forKey:@"AEStable"];
+    [maker setObject:@1
+              forKey:@"AFStable"];
+    [maker setObject:@((int)sf_rand_range(110, 190))
+              forKey:@"AEAverage"];
+    [maker setObject:@((int)sf_rand_range(70, 110))
+              forKey:@"AFConfidence"];
+    [maker setObject:@(SF_EXPOSURE_BASE_S / (exposure > 0.0005 ? exposure : 0.0005))
+              forKey:@"AGC"];
+    [maker setObject:@((double)1.0 + sf_rand_range(-0.05, 0.05))
+              forKey:@"DGain"];
+    return maker;
+}
+
+// ----------------------------------------------------------------------------
 // EXIF-Synthese: Basiswerte aus Profil-Datei (falls gelesen) sonst
-// iPhone-8-Defaults; darueber die dynamische Sensorfluktuation.
+// iPhone-8-Defaults; darueber der Random-Walk (dynamische Sensorfluktuation).
 // ----------------------------------------------------------------------------
 static NSDictionary *sf_build_exif(void) {
-    double isoBase  = atomic_load_explicit(&g_cfgISO, memory_order_relaxed);
-    double expBase  = atomic_load_explicit(&g_cfgExposure, memory_order_relaxed);
     double fnum     = atomic_load_explicit(&g_cfgFNumber, memory_order_relaxed);
 
-    int iso = (int)llround(isoBase) + (int)sf_rand_range(-SF_ISO_DELTA, SF_ISO_DELTA + 1);
-    if (iso < 25) iso = 25;
-    if (iso > 6400) iso = 6400;
-
-    double exposure = expBase + sf_rand_range(-SF_EXPOSURE_JITTER_S, SF_EXPOSURE_JITTER_S);
-    if (exposure < 0.0005) exposure = 0.0005;
+    int iso         = sf_walk_iso();
+    double exposure = sf_walk_exposure();
 
     NSMutableDictionary *exif = [NSMutableDictionary dictionaryWithCapacity:5];
     [exif setObject:@(fnum)
@@ -355,8 +426,18 @@ static void sf_update_pts(CMSampleBufferRef buf) {
             if (sf_metadata_is_valid(existing)) {
                 atomic_fetch_add_explicit(&g_passCount, 1, memory_order_relaxed);
             } else {
-                NSDictionary *exif = sf_build_exif();
-                NSDictionary *meta = @{ SF_EXIF_DICT_KEY : exif };
+                // Synthese: {Exif} + {MakerApple} in EINEM Dictionary.
+                // CMSetAttachment erfolgt unmittelbar hier — also direkt
+                // nachdem der (ggf. durch einen Frame-Swap-Tweak ersetzte)
+                // Buffer durchreicht. Kein neuer Buffer, nur Attachments.
+                NSDictionary *exif  = sf_build_exif();
+                double exposure =
+                    (double)atomic_load_explicit(&g_lastExposure, memory_order_relaxed);
+                if (exposure < 0.0005) exposure = 0.0005;
+                NSDictionary *maker = sf_build_maker(exposure);
+                NSDictionary *meta = @{ SF_EXIF_DICT_KEY : exif,
+                                        @"{MakerApple}"    : maker };
+
                 CMSetAttachment(sb, SF_METADATA_KEY,
                                 (__bridge CFTypeRef)meta,
                                 kCMAttachmentMode_ShouldPropagate);
@@ -397,6 +478,6 @@ static void sf_update_pts(CMSampleBufferRef buf) {
         sf_status_runloop();
     });
 
-    NSLog(@"[SensorForgePro] v1.2 loaded in %@ — status port %d (read+commands)",
+    NSLog(@"[SensorForgePro] v1.3 loaded in %@ — status port %d (read+commands, Exif+MakerApple, random-walk)",
           [[NSProcessInfo processInfo] processName], SF_STATUS_PORT);
 }
