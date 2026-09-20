@@ -152,11 +152,70 @@ static void sf_load_profile(const char *path) {
 }
 
 // ----------------------------------------------------------------------------
-// Status-Server: Loopback-TCP auf 8797. Jede Verbindung bekommt sofort eine
-// Statuszeile (Send erfolgt direkt nach accept; ein eingehendes Kommando
-// wird ignoriert — Lesen genuegt zum Pollen). Loopback-Bind ist in der
-// mediaserverd-Sandbox erlaubt (geräte-verifiziert im NikeCam-Projekt).
+// Status-Server: Loopback-TCP auf 8797. Zwei Funktionen:
+//   * READ-Seite: jede Verbindung liefert sofort eine Statuszeile.
+//   * WRITE-Seite (v1.2): eintreffende Kommandos  iso=320  exposure=0.02
+//     fnumber=2.2  lens=Linsenname  werden geparst und live uebernommen.
+//     So speist ein Host-Prozess (PC-Tool, SpringBoard-Hub) die aus einem
+//     Bild/Video berechneten EXIF-Werte direkt in den Daemon — der einzige
+//     Kanal, der die mediaserverd-Sandbox-Pfadsicht umgeht (Datei-Read
+//     endet hier mit errno 2/ENOENT, siehe %ctor-Sonde).
 // ----------------------------------------------------------------------------
+static void sf_handle_command(const char *cmd) {
+    // Puffer-Kopie: sicher gegen nicht-terminierte Recv-Brocken.
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", cmd);
+
+    const char *key = buf;
+    // Mehrere Kommandos je Zeile, getrennt durch Leerzeichen.
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t\r\n,", &save);
+         tok != NULL;
+         tok = strtok_r(NULL, " \t\r\n,", &save)) {
+
+        char *eq = strchr(tok, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        const char *val = eq + 1;
+
+        if (strcmp(tok, "iso") == 0) {
+            double d = atof(val);
+            if (d >= 25.0 && d <= 6400.0)
+                atomic_store_explicit(&g_cfgISO, d, memory_order_relaxed);
+        } else if (strcmp(tok, "exposure") == 0) {
+            double d = atof(val);
+            if (d > 0.0 && d <= 2.0)
+                atomic_store_explicit(&g_cfgExposure, d, memory_order_relaxed);
+        } else if (strcmp(tok, "fnumber") == 0) {
+            double d = atof(val);
+            if (d >= 0.5 && d <= 32.0)
+                atomic_store_explicit(&g_cfgFNumber, d, memory_order_relaxed);
+        } else if (strcmp(tok, "lens") == 0) {
+            snprintf(g_cfgLens, sizeof(g_cfgLens), "%s", val);
+        }
+    }
+}
+
+static void sf_build_status_line(char *out, size_t outsz) {
+    snprintf(out, outsz,
+        "sforge=1 ver=1.2 "
+        "emit=%u synth=%u pass=%u pts=%u "
+        "probeTxt=%d(%d) probeJpg=%d(%d) "
+        "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s\n",
+        (unsigned)atomic_load_explicit(&g_emitCount,  memory_order_relaxed),
+        (unsigned)atomic_load_explicit(&g_synthCount, memory_order_relaxed),
+        (unsigned)atomic_load_explicit(&g_passCount,  memory_order_relaxed),
+        (unsigned)atomic_load_explicit(&g_ptsCount,   memory_order_relaxed),
+        atomic_load_explicit(&g_probeTxt,   memory_order_relaxed),
+        atomic_load_explicit(&g_probeTxtErrno, memory_order_relaxed),
+        atomic_load_explicit(&g_probeJpg,   memory_order_relaxed),
+        atomic_load_explicit(&g_probeJpgErrno, memory_order_relaxed),
+        atomic_load_explicit(&g_cfgISO,      memory_order_relaxed),
+        atomic_load_explicit(&g_cfgExposure, memory_order_relaxed),
+        atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed),
+        g_cfgLens[0] != '\0' ? g_cfgLens : SF_EXIF_LENS_MODEL);
+}
+
 static void sf_status_runloop(void) {
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) return;
@@ -170,34 +229,29 @@ static void sf_status_runloop(void) {
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(srv);
-        return;  // Port belegt? (z. B. zweite Ladung) -> still aufgeben
+        return;  // Port belegt? (z. B. doppelte Ladung) -> still aufgeben
     }
     if (listen(srv, 4) != 0) { close(srv); return; }
+
+    // recv-Timeout, damit accept-Schleife nicht haengt.
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
 
     for (;;) {
         int c = accept(srv, NULL, NULL);
         if (c < 0) continue;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+        // 1) Eingehende Kommandos einlesen (falls der Client welche sendet).
+        char inbuf[256];
+        ssize_t n = recv(c, inbuf, sizeof(inbuf) - 1, 0);
+        if (n > 0) {
+            inbuf[n] = '\0';
+            sf_handle_command(inbuf);
+        }
+
+        // 2) Immer die volle Statuszeile zurueckgeben (Poll-Modus).
         char reply[512];
-        snprintf(reply, sizeof(reply),
-            "sforge=1 ver=1.1 "
-            "emit=%u synth=%u pass=%u pts=%u "
-            "probeTxt=%d(%d) probeJpg=%d(%d) probeVartmp=%d(%d) "
-            "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f\n",
-            (unsigned)atomic_load_explicit(&g_emitCount,  memory_order_relaxed),
-            (unsigned)atomic_load_explicit(&g_synthCount, memory_order_relaxed),
-            (unsigned)atomic_load_explicit(&g_passCount,  memory_order_relaxed),
-            (unsigned)atomic_load_explicit(&g_ptsCount,   memory_order_relaxed),
-            atomic_load_explicit(&g_probeTxt,   memory_order_relaxed),
-            atomic_load_explicit(&g_probeTxtErrno, memory_order_relaxed),
-            atomic_load_explicit(&g_probeJpg,   memory_order_relaxed),
-            atomic_load_explicit(&g_probeJpgErrno, memory_order_relaxed),
-            atomic_load_explicit(&g_probeVartmp, memory_order_relaxed),
-            atomic_load_explicit(&g_probeVartmpErrno, memory_order_relaxed),
-            atomic_load_explicit(&g_cfgISO,      memory_order_relaxed),
-            atomic_load_explicit(&g_cfgExposure, memory_order_relaxed),
-            atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed));
-
+        sf_build_status_line(reply, sizeof(reply));
         (void)send(c, reply, strlen(reply), 0);
         close(c);
     }
@@ -338,6 +392,6 @@ static void sf_update_pts(CMSampleBufferRef buf) {
         sf_status_runloop();
     });
 
-    NSLog(@"[SensorForgePro] v1.1 loaded in %@ — status port %d, profile+probe aktiv",
+    NSLog(@"[SensorForgePro] v1.2 loaded in %@ — status port %d (read+commands)",
           [[NSProcessInfo processInfo] processName], SF_STATUS_PORT);
 }
