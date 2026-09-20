@@ -1,30 +1,34 @@
 // ============================================================================
-//  SensorForge Pro — Tweak.x  (v1.1)
+//  SensorForge Pro — Tweak.x  (v1.4)
 // ----------------------------------------------------------------------------
 //  Eigenstaendiger iOS-System-Tweak (mediaserverd, iOS 16.6-16.7.16, roothide).
 //  ZWECK: Downstream-Metadaten-Synthese fuer emulierte Kamera-Feeds.
 //
-//  NEU IN v1.1:
-//   * Status-Port 8797 (Loopback-TCP, sandbox-freundlich) mit Live-Zaehlern
-//     (emit/synth/pass/pts) — dieser Port BELEGT die Injektion, da NSLog in
-//     mediaserverd gefiltert wird.
-//   * Datei-Lese-Sonde im %ctor: try open() auf die Profil-Pfade und meldet
-//     am Status-Port probeTxt/JPG + errno. Damit messen wir, ob der
-//     sandboxed Daemon die Profil-Datei ueberhaupt LESEN darf.
-//   * Profil-Datei-Support (fallback auf iPhone-8-Defaults):
-//       /var/mobile/Documents/sensorforge_profile.txt
-//       Zeilenformat:  iso=200
-//                      exposure=0.033
-//                      fnumber=1.8
-//                      lens=iPhone 8 Back Camera
-//     Werte ueberschreiben die Basiswerte der Synthese (die dynamische
-//     Fluktuation bleibt erhalten). Damit laesst sich die Ausgabe eines
-//     Host-Rechners/Webservers direkt per Datei einspeisen — sofern die
-//     Sandbox-Sonde Leserechte bestaetigt.
+//  NEU IN v1.4 — ISP-Signatur (Forensik-grade Konsistenz):
+//   * LuxLevel  = 250*F^2/(ISO*Exposure) — aus DEN WERTEN berechnet, die auch
+//     in {Exif} landen. Lux/ISO/Exposure sind damit mathematisch konsistent
+//     (Belichtungsgleichung, Kalibrierkonstante K=12.5 wie im echten AE).
+//     Ein Frame ohne korreliertes Lux-Level "schreit PC-generiert".
+//   * ispDGain (Tag 10): 256-basiert (256=1.0x), mit AGC gekoppelt — echte
+//     iPhones fuehren IMMER einen ISP-Digital-Gain; fehlend = Fakenachweis.
+//   * DigitalFlash (Tag 15) + focusPosition/LensPosition (Tag 13, Walk um
+//     0.78) — Hinweise auf echte Hardware-Autofokus-Routine.
+//   * MakerApple nutzt Apples NUMERISCHE MakerNote-Tags (wie echte iOS-16-
+//     Frames), keine ausgedachten String-Keys:
+//        1=LuxLevel, 2=AEStable, 3=AETarget, 4=AEAverage, 5=AFStable,
+//        7=AFMode, 8=AGC, 9=DGain, 10=ispDGain, 13=focusPosition,
+//        15=DigitalFlash.
+//   * NEU: "keys?"-Kommando am Status-Port — dumpft die ECHTEN Key-Namen der
+//     Apple-Metadaten von realen (passthrough-)Frames. Damit lässt sich das
+//     hier synthetisierte Feld-Set 1:1 mit der echten Hardware vergleichen
+//     und verfeinern — kein Raten.
+//
+//  Status-Port 8797: READ (Statuszeile) + WRITE (iso= exposure= fnumber=
+//  lens= lux= flash= keys?).
 //
 //  UNVERAENDERTE SCHUTZREGELN: keine Reallokation (nur CMSetAttachment),
 //  Passthrough bei validen Metadaten, Hook maximal downstream
-//  (BWNodeOutput emitSampleBuffer:).
+//  (BWNodeOutput emitSampleBuffer:), PTS-Monotonie-Handling.
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -33,6 +37,7 @@
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
@@ -45,54 +50,65 @@
 #include <dispatch/dispatch.h>
 
 // --- Attachment-Key ---------------------------------------------------------
-// Exakter CoreMedia-Wert des MetadataDictionary-Keys (fuehrendes Leerzeichen
-// ist kein Tippfehler): kCMSampleBufferAttachmentKey_MetadataDictionary
-// = CFSTR(" MetadataDictionary").
 #define SF_METADATA_KEY       CFSTR(" MetadataDictionary")
 #define SF_EXIF_DICT_KEY      @"{Exif}"
 
-// --- iPhone-8-Defaultprofil (gilt, solange keine Profil-Datei da ist) ------
+// --- iPhone-8-Defaultprofil -----------------------------------------------
 #define SF_EXIF_LENS_MODEL    @"iPhone 8 Back Camera"
 #define SF_EXIF_FNUMBER       (@1.8)
 #define SF_ISO_BASE           200
 #define SF_ISO_DELTA          5        // Pendelband => 195..205
 #define SF_EXPOSURE_BASE_S    0.033    // 1/30 s
-#define SF_EXPOSURE_JITTER_S  0.0006
 
 // --- Status-Port -----------------------------------------------------------
 #define SF_STATUS_PORT        8797
 
-// --- Konfiguration (von der Profil-Datei/Kommandoport ueberschreibbar) ------
+// ----------------------------------------------------------------------------
+// Fotometrische Konstanten: K = 12.5 (Kalibrierkonstante des klassischen
+// Belichtungsmessers), C = 250 (Incident-Light-Konstante). LS /= ISOSpeed.
+// Diese Zahl koppelt LuxLevel, ISO und Exposure — Kern der ISP-Korrelation.
+// ----------------------------------------------------------------------------
+#define SF_PHOTOMETRIC_C      250.0
+
+// --- Konfiguration (Profil-Datei/Kommandoport ueberschreibbar) --------------
 static _Atomic(double) g_cfgISO       = SF_ISO_BASE;
 static _Atomic(double) g_cfgExposure  = SF_EXPOSURE_BASE_S;
 static _Atomic(double) g_cfgFNumber   = 1.8;
-static char            g_cfgLens[64]; // einmalig im %ctor geschrieben
+static _Atomic(double) g_cfgLux       = 0.0;    // 0 = auto aus ISO/Exposure
+static _Atomic(int)    g_cfgFlash     = 0;      // DigitalFlash-Override
+static char            g_cfgLens[64];
 
-// --- Random-Walk-State (v1.3): statt reinem Jitter ein zeitabhaengiger Walk
-//     mit Rueckstellkraft zur Basis — so pendelt der "Sensor" wie ein echter
-//     AEC-Loop um den Arbeitspunkt.
-static _Atomic(double) g_walkISO      = SF_ISO_BASE;
-static _Atomic(double) g_walkExposure = SF_EXPOSURE_BASE_S;
-// Letzte publizierte Werte (Statuszeile => Walk sichtbar).
-static _Atomic(int)    g_lastISO      = SF_ISO_BASE;
-static _Atomic(double) g_lastExposure = SF_EXPOSURE_BASE_S;
+// --- Random-Walk-State (v1.3/v1.4) -------------------------------------------
+static _Atomic(double) g_walkISO       = SF_ISO_BASE;
+static _Atomic(double) g_walkExposure  = SF_EXPOSURE_BASE_S;
+static _Atomic(double) g_walkLensPos   = 0.78;  // Fokusposition 0..1
+static _Atomic(int)    g_lastISO       = SF_ISO_BASE;
+static _Atomic(double) g_lastExposure  = SF_EXPOSURE_BASE_S;
+static _Atomic(double) g_lastLux       = 100.0;
+static _Atomic(double) g_lastLensPos   = 0.78;
 
-// --- Live-Zaehler (Status-Port) ---------------------------------------------
-static _Atomic(uint32_t) g_emitCount  = 0;  // Hook-Aufrufe gesamt (Injektionsbeweis)
-static _Atomic(uint32_t) g_synthCount = 0;  // simulierte Frames
-static _Atomic(uint32_t) g_passCount  = 0;  // Passthrough (valide Metadaten)
-static _Atomic(uint32_t) g_ptsCount   = 0;  // PTS-Updates
+// --- Live-Zaehler ------------------------------------------------------------
+static _Atomic(uint32_t) g_emitCount  = 0;
+static _Atomic(uint32_t) g_synthCount = 0;
+static _Atomic(uint32_t) g_passCount  = 0;
+static _Atomic(uint32_t) g_ptsCount   = 0;
 
-// --- Lese-Sonde (Ergebnisse fuer den Status-Port) ---------------------------
-static _Atomic(int) g_probeTxt   = -1;   // 1=lesbar, 0=fehlgeschlagen
-static _Atomic(int) g_probeTxtErrno = 0;
-static _Atomic(int) g_probeJpg   = -1;
-static _Atomic(int) g_probeJpgErrno = 0;
-static _Atomic(int) g_probeVartmp = -1;
-static _Atomic(int) g_probeVartmpErrno = 0;
+// --- Lese-Sonde --------------------------------------------------------------
+static _Atomic(int) g_probeTxt       = -1;
+static _Atomic(int) g_probeTxtErrno  = 0;
+static _Atomic(int) g_probeJpg       = -1;
+static _Atomic(int) g_probeJpgErrno  = 0;
+
+// --- Key-Dump (keys? Kommando) -----------------------------------------------
+// Rate-gebremster (max. 1x/s) Abgriff der ECHTEN Key-Namen realer
+// Apple-Frames (Pass-Zweig). Server-seitig per "keys?" abrufbar.
+static char            g_keydump[3072] = {0};
+static _Atomic(time_t) g_lastDumpSec   = 0;
+static _Atomic(int)    g_hasDump       = 0;
+static _Atomic(int)    g_wantKeys      = 0;
 
 // ----------------------------------------------------------------------------
-// xorshift32-PRNG (sperrlos, Hot-Path-tauglich; kein libc-rand-Locking).
+// xorshift32-PRNG (sperrlos, Hot-Path-tauglich).
 // ----------------------------------------------------------------------------
 static _Atomic(uint32_t) sf_rng_state = 0;
 
@@ -112,8 +128,7 @@ static double sf_rand_range(double lo, double hi) {
 }
 
 // ----------------------------------------------------------------------------
-// Lese-Sonde: darf mediaserverd die Profil-Pfade oeffnen? Ergebnis nur
-// diagnostisch (open + read, kein write).
+// Lese-Sonde: darf mediaserverd die Profil-Pfade oeffnen?
 // ----------------------------------------------------------------------------
 static void sf_probe_path(const char *path, _Atomic(int) *result,
                           _Atomic(int) *err) {
@@ -125,8 +140,7 @@ static void sf_probe_path(const char *path, _Atomic(int) *result,
 }
 
 // ----------------------------------------------------------------------------
-// Profil laden: einfaches Zeilenformat key=value. Fehlen Zeilen oder die
-// Datei, bleiben die iPhone-8-Defaults aktiv.
+// Profil laden (Key=Value je Zeile).
 // ----------------------------------------------------------------------------
 static void sf_load_profile(const char *path) {
     FILE *f = fopen(path, "r");
@@ -136,24 +150,25 @@ static void sf_load_profile(const char *path) {
         char *eq = strchr(line, '=');
         if (eq == NULL) continue;
         *eq = '\0';
-        char *key = line;
-        // trailing \n/\r entfernen
         char *val = eq + 1;
         val[strcspn(val, "\r\n")] = '\0';
-
-        if (strcmp(key, "iso") == 0) {
+        if (strcmp(line, "iso") == 0) {
             double d = atof(val);
             if (d >= 25.0 && d <= 6400.0)
                 atomic_store_explicit(&g_cfgISO, d, memory_order_relaxed);
-        } else if (strcmp(key, "exposure") == 0) {
+        } else if (strcmp(line, "exposure") == 0) {
             double d = atof(val);
             if (d > 0.0 && d <= 2.0)
                 atomic_store_explicit(&g_cfgExposure, d, memory_order_relaxed);
-        } else if (strcmp(key, "fnumber") == 0) {
+        } else if (strcmp(line, "fnumber") == 0) {
             double d = atof(val);
             if (d >= 0.5 && d <= 32.0)
                 atomic_store_explicit(&g_cfgFNumber, d, memory_order_relaxed);
-        } else if (strcmp(key, "lens") == 0) {
+        } else if (strcmp(line, "lux") == 0) {
+            double d = atof(val);
+            if (d >= 0.0 && d <= 250000.0)
+                atomic_store_explicit(&g_cfgLux, d, memory_order_relaxed);
+        } else if (strcmp(line, "lens") == 0) {
             snprintf(g_cfgLens, sizeof(g_cfgLens), "%s", val);
         }
     }
@@ -161,21 +176,50 @@ static void sf_load_profile(const char *path) {
 }
 
 // ----------------------------------------------------------------------------
-// Status-Server: Loopback-TCP auf 8797. Zwei Funktionen:
-//   * READ-Seite: jede Verbindung liefert sofort eine Statuszeile.
-//   * WRITE-Seite (v1.2): eintreffende Kommandos  iso=320  exposure=0.02
-//     fnumber=2.2  lens=Linsenname  werden geparst und live uebernommen.
-//     So speist ein Host-Prozess (PC-Tool, SpringBoard-Hub) die aus einem
-//     Bild/Video berechneten EXIF-Werte direkt in den Daemon — der einzige
-//     Kanal, der die mediaserverd-Sandbox-Pfadsicht umgeht (Datei-Read
-//     endet hier mit errno 2/ENOENT, siehe %ctor-Sonde).
+// Key-Dump realer Apple-Frames (max. 1x/s) — Grundlage fuer den
+// Forensik-Abgleich der MakerNote-Tags.
+// ----------------------------------------------------------------------------
+static void sf_maybe_dump_keys(NSDictionary *meta) {
+    if (meta == nil || ![meta isKindOfClass:NSDictionary.class]) return;
+    time_t now = time(NULL);
+    time_t last = atomic_load_explicit(&g_lastDumpSec, memory_order_relaxed);
+    if (now == last) return;                       // Rate-Limit 1 Hz
+    atomic_store_explicit(&g_lastDumpSec, now, memory_order_relaxed);
+
+    NSMutableString *s = [NSMutableString string];
+    NSDictionary *exif  = [meta objectForKey:SF_EXIF_DICT_KEY];
+    NSDictionary *maker = [meta objectForKey:@"{MakerApple}"];
+    if ([exif isKindOfClass:NSDictionary.class]) {
+        [s appendString:@"exif:"];
+        for (id k in [[exif allKeys] sortedArrayUsingSelector:@selector(compare:)])
+            [s appendFormat:@"%@;", k];
+    }
+    if ([maker isKindOfClass:NSDictionary.class]) {
+        [s appendString:@" | maker:"];
+        for (id k in [[maker allKeys] sortedArrayUsingSelector:@selector(compare:)])
+            [s appendFormat:@"%@;", k];
+    }
+    const char *utf8 = [s UTF8String];
+    if (utf8 != NULL) {
+        strncpy(g_keydump, utf8, sizeof(g_keydump) - 1);
+        g_keydump[sizeof(g_keydump) - 1] = '\0';
+        atomic_store_explicit(&g_hasDump, 1, memory_order_relaxed);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Status-Server: Loopback-TCP auf 8797.
+//   READ-Seite: Statuszeile; mit Prefix "keys?" wird der Key-Dump geliefert.
+//   WRITE-Seite: iso= exposure= fnumber= lens= lux= flash= (live uebernommen).
 // ----------------------------------------------------------------------------
 static void sf_handle_command(const char *cmd) {
-    // Puffer-Kopie: sicher gegen nicht-terminierte Recv-Brocken.
     char buf[128];
     snprintf(buf, sizeof(buf), "%s", cmd);
 
-    // Mehrere Kommandos je Zeile, getrennt durch Leerzeichen.
+    if (strstr(buf, "keys?") != NULL) {
+        atomic_store_explicit(&g_wantKeys, 1, memory_order_relaxed);
+    }
+
     char *save = NULL;
     for (char *tok = strtok_r(buf, " \t\r\n,", &save);
          tok != NULL;
@@ -198,13 +242,19 @@ static void sf_handle_command(const char *cmd) {
             double d = atof(val);
             if (d >= 0.5 && d <= 32.0)
                 atomic_store_explicit(&g_cfgFNumber, d, memory_order_relaxed);
+        } else if (strcmp(tok, "lux") == 0) {
+            double d = atof(val);
+            if (d >= 0.0 && d <= 250000.0)
+                atomic_store_explicit(&g_cfgLux, d, memory_order_relaxed);
+        } else if (strcmp(tok, "flash") == 0) {
+            atomic_store_explicit(&g_cfgFlash, atoi(val) ? 1 : 0,
+                                  memory_order_relaxed);
         } else if (strcmp(tok, "lens") == 0) {
             snprintf(g_cfgLens, sizeof(g_cfgLens), "%s", val);
         }
     }
 }
 
-// Fallback-Lenslabel als C-String (sf_build_status_line lebt im C-Kontext).
 static const char *sf_default_lens(void) {
     static const char defl[] = "iPhone 8 Back Camera";
     return defl;
@@ -212,11 +262,12 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.3 "
+        "sforge=1 ver=1.4 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
         "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
-        "walkIso=%d walkExposure=%.4f\n",
+        "walkIso=%d walkExposure=%.4f lux=%.1f lensPos=%.3f "
+        "flash=%d dump=%d\n",
         (unsigned)atomic_load_explicit(&g_emitCount,  memory_order_relaxed),
         (unsigned)atomic_load_explicit(&g_synthCount, memory_order_relaxed),
         (unsigned)atomic_load_explicit(&g_passCount,  memory_order_relaxed),
@@ -229,8 +280,12 @@ static void sf_build_status_line(char *out, size_t outsz) {
         atomic_load_explicit(&g_cfgExposure, memory_order_relaxed),
         atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed),
         g_cfgLens[0] != '\0' ? g_cfgLens : sf_default_lens(),
-        atomic_load_explicit(&g_lastISO,     memory_order_relaxed),
-        atomic_load_explicit(&g_lastExposure, memory_order_relaxed));
+        atomic_load_explicit(&g_lastISO,      memory_order_relaxed),
+        atomic_load_explicit(&g_lastExposure, memory_order_relaxed),
+        atomic_load_explicit(&g_lastLux,      memory_order_relaxed),
+        atomic_load_explicit(&g_lastLensPos,  memory_order_relaxed),
+        atomic_load_explicit(&g_cfgFlash,     memory_order_relaxed),
+        atomic_load_explicit(&g_hasDump,      memory_order_relaxed));
 }
 
 static void sf_status_runloop(void) {
@@ -250,7 +305,6 @@ static void sf_status_runloop(void) {
     }
     if (listen(srv, 4) != 0) { close(srv); return; }
 
-    // recv-Timeout, damit accept-Schleife nicht haengt.
     struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
 
     for (;;) {
@@ -258,7 +312,6 @@ static void sf_status_runloop(void) {
         if (c < 0) continue;
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        // 1) Eingehende Kommandos einlesen (falls der Client welche sendet).
         char inbuf[256];
         ssize_t n = recv(c, inbuf, sizeof(inbuf) - 1, 0);
         if (n > 0) {
@@ -266,9 +319,16 @@ static void sf_status_runloop(void) {
             sf_handle_command(inbuf);
         }
 
-        // 2) Immer die volle Statuszeile zurueckgeben (Poll-Modus).
-        char reply[512];
-        sf_build_status_line(reply, sizeof(reply));
+        char reply[3584];
+        if (atomic_exchange_explicit(&g_wantKeys, 0, memory_order_relaxed)) {
+            // Key-Dump liefern (forensischer Feld-Abgleich).
+            snprintf(reply, sizeof(reply), "keys: %s\n",
+                     (atomic_load_explicit(&g_hasDump, memory_order_relaxed)
+                        ? g_keydump
+                        : "(noch keine echten Apple-Frames gesehen)"));
+        } else {
+            sf_build_status_line(reply, sizeof(reply));
+        }
         (void)send(c, reply, strlen(reply), 0);
         close(c);
     }
@@ -300,16 +360,12 @@ static NSString *sf_exif_timestamp(void) {
 }
 
 // ----------------------------------------------------------------------------
-// Random-Walk (v1.3): kleiner Schritt pro Aufruf + schwache Rueckstellkraft
-// zum Arbeitspunkt. Deckel = das Pendelband des Profils, damit der Wert nie
-// ausreist. Ergebnis: natuerliche AEC-artige Fluktuation statt weissen
-// Rauschens.
+// Random-Walk (ISO, Exposure, LensPosition) mit Rueckstellkraft.
 // ----------------------------------------------------------------------------
 static int sf_walk_iso(void) {
     double cur  = atomic_load_explicit(&g_walkISO, memory_order_relaxed);
     double base = atomic_load_explicit(&g_cfgISO, memory_order_relaxed);
 
-    // Schritt: 0..1.5 ISO pro Frame-Zyklus + 3% Rueckstellkraft zur Mitte.
     double step = sf_rand_range(-1.5, 1.5) + (base - cur) * 0.03;
     cur += step;
     if (cur < base - SF_ISO_DELTA) cur = base - SF_ISO_DELTA;
@@ -326,7 +382,6 @@ static double sf_walk_exposure(void) {
     double cur  = atomic_load_explicit(&g_walkExposure, memory_order_relaxed);
     double base = atomic_load_explicit(&g_cfgExposure, memory_order_relaxed);
 
-    // Schritt in Sekunden: ~+-0.3 ms + Rueckstellkraft; Deckel +-3%.
     double step = sf_rand_range(-0.0003, 0.0003) + (base - cur) * 0.03;
     cur += step;
     if (cur < base * 0.97) cur = base * 0.97;
@@ -338,35 +393,84 @@ static double sf_walk_exposure(void) {
     return cur;
 }
 
-// ----------------------------------------------------------------------------
-// MakerApple-Synthese (v1.3): Apple-typische Sensorfelder, die moderne Apps
-// und EXIF-Tools neben "{Exif}" erwarten. Klein und plausibel gehalten;
-// echte Frames fuehren ~34 Felder — die hier genannten sind die haeufig
-// geprueften (AEStable/AFStable/AEAverage/AGC/DGain).
-// Analog-Gain (AGC) aus dem Belichtungsverhaeltnis zur 1/30-s-Norm.
-// ----------------------------------------------------------------------------
-static NSDictionary *sf_build_maker(double exposure) {
-    NSMutableDictionary *maker = [NSMutableDictionary dictionaryWithCapacity:6];
-
-    // ueberwiegend stabil, selten kurzer Sprung (AEC reagiert).
-    [maker setObject:@((sf_rand_u32() % 100) < 92 ? 1 : 0)
-              forKey:@"AEStable"];
-    [maker setObject:@1
-              forKey:@"AFStable"];
-    [maker setObject:@((int)sf_rand_range(110, 190))
-              forKey:@"AEAverage"];
-    [maker setObject:@((int)sf_rand_range(70, 110))
-              forKey:@"AFConfidence"];
-    [maker setObject:@(SF_EXPOSURE_BASE_S / (exposure > 0.0005 ? exposure : 0.0005))
-              forKey:@"AGC"];
-    [maker setObject:@((double)1.0 + sf_rand_range(-0.05, 0.05))
-              forKey:@"DGain"];
-    return maker;
+// Fokusposition: iPhone-8-Rueckkamera ruht bei ~0.75-0.80 (Mitteldistanz),
+// kleine kontinuierliche Schwankung wie eine echte AF-Routine.
+static double sf_walk_lenspos(void) {
+    double cur = atomic_load_explicit(&g_walkLensPos, memory_order_relaxed);
+    double step = sf_rand_range(-0.004, 0.004) + (0.78 - cur) * 0.02;
+    cur += step;
+    if (cur < 0.60) cur = 0.60;
+    if (cur > 0.90) cur = 0.90;
+    atomic_store_explicit(&g_walkLensPos, cur, memory_order_relaxed);
+    atomic_store_explicit(&g_lastLensPos, cur, memory_order_relaxed);
+    return cur;
 }
 
 // ----------------------------------------------------------------------------
-// EXIF-Synthese: Basiswerte aus Profil-Datei (falls gelesen) sonst
-// iPhone-8-Defaults; darueber der Random-Walk (dynamische Sensorfluktuation).
+// LuxLevel — fotometrisch KORRELIERT mit ISO und Exposure:
+//   Lux = C * F^2 / (ISO * t),  C = 250 (K=12.5).
+// Damit erfüllt das Dict die Belichtungsgleichung — ein PC-generierter
+// Frame fällt genau an diesem Check auf, wenn die Werte nicht zusammenpassen.
+// lux=... am Port schaltet auf manuellen Lux (0 = auto).
+// ----------------------------------------------------------------------------
+static double sf_compute_lux(int iso, double exposure, double fnum) {
+    double override = atomic_load_explicit(&g_cfgLux, memory_order_relaxed);
+    double lux;
+    if (override > 0.0) {
+        lux = override;
+    } else {
+        lux = SF_PHOTOMETRIC_C * fnum * fnum /
+              ((double)iso * (exposure > 0.0005 ? exposure : 0.0005));
+    }
+    // Kleines Messrauschen des ALS (Ambient Light Sensor).
+    lux *= (1.0 + sf_rand_range(-0.015, 0.015));
+    if (lux < 0.1) lux = 0.1;
+    if (lux > 250000.0) lux = 250000.0;
+    atomic_store_explicit(&g_lastLux, lux, memory_order_relaxed);
+    return lux;
+}
+
+// ----------------------------------------------------------------------------
+// MakerApple-Synthese (v1.4): numerische Apple-MakerNote-Tags.
+// Basis: Immobilisierung der ECHTEN Tags erfolgt live via keys? (echte
+// Frames dumpfen ihre Key-Namen). Hier die Apple-Dokumentation der
+// haeufigsten: 1 LuxLevel, 2 AEStable, 3 AETarget, 4 AEAverage, 5 AFStable,
+// 7 AFMode(2=continuous)*, 8 AGC, 9 DGain, 10 ispDGain(256-basiert),
+// 13 focusPosition(0..1), 15 DigitalFlash.
+// ----------------------------------------------------------------------------
+static NSDictionary *sf_build_maker(int iso, double exposure, double fnum) {
+    double lux = sf_compute_lux(iso, exposure, fnum);
+    double agc = SF_EXPOSURE_BASE_S / (exposure > 0.0005 ? exposure : 0.0005);
+
+    // ispDGain: 256 = 1.0x. Apple laesst den ISP-Gain mit dem AGC mitlaufen;
+    // fehlt dieses Feld, ist der Frame nachweislich nie durch die physische
+    // Linse gegangen.
+    int ispdg = 256 + (int)llround((agc - 1.0) * 220.0);
+    if (ispdg < 256) ispdg = 256;
+    if (ispdg > 2048) ispdg = 2048;
+    ispdg += (int)sf_rand_range(-4.0, 5.0);
+
+    double lensPos = sf_walk_lenspos();
+    int digFlash   = atomic_load_explicit(&g_cfgFlash, memory_order_relaxed) ? 1 : 0;
+    int aeStable   = (sf_rand_u32() % 100) < 92 ? 1 : 0;   // selten kurzer AEC-Einbruch
+
+    NSMutableDictionary *m = [NSMutableDictionary dictionaryWithCapacity:11];
+    [m setObject:@((int)llround(lux))      forKey:@1];   // LuxLevel
+    [m setObject:@(aeStable)               forKey:@2];   // AEStable
+    [m setObject:@((int)llround(lux * 0.8)) forKey:@3];  // AETarget
+    [m setObject:@((int)sf_rand_range(110.0, 190.0)) forKey:@4]; // AEAverage
+    [m setObject:@1                        forKey:@5];   // AFStable
+    [m setObject:@2                        forKey:@7];   // AFMode: continuous (Video)
+    [m setObject:@(agc)                    forKey:@8];   // AGC (1.0 bei 1/30 s)
+    [m setObject:@(1.0 + sf_rand_range(-0.03, 0.03)) forKey:@9]; // DGain
+    [m setObject:@(ispdg)                  forKey:@10];  // ispDGain
+    [m setObject:@(lensPos)                forKey:@13];  // focusPosition
+    [m setObject:@(digFlash)               forKey:@15];  // DigitalFlash
+    return m;
+}
+
+// ----------------------------------------------------------------------------
+// EXIF-Synthese: Basis + Random-Walk.
 // ----------------------------------------------------------------------------
 static NSDictionary *sf_build_exif(void) {
     double fnum     = atomic_load_explicit(&g_cfgFNumber, memory_order_relaxed);
@@ -425,16 +529,18 @@ static void sf_update_pts(CMSampleBufferRef buf) {
 
             if (sf_metadata_is_valid(existing)) {
                 atomic_fetch_add_explicit(&g_passCount, 1, memory_order_relaxed);
+                // ECHTE Apple-Metadaten: Key-Namen periodisch abgreifen
+                // (Grundlage fuer den Forensik-Abgleich via keys?).
+                sf_maybe_dump_keys(existing);
             } else {
-                // Synthese: {Exif} + {MakerApple} in EINEM Dictionary.
-                // CMSetAttachment erfolgt unmittelbar hier — also direkt
-                // nachdem der (ggf. durch einen Frame-Swap-Tweak ersetzte)
-                // Buffer durchreicht. Kein neuer Buffer, nur Attachments.
-                NSDictionary *exif  = sf_build_exif();
-                double exposure =
-                    (double)atomic_load_explicit(&g_lastExposure, memory_order_relaxed);
+                // Synthese: {Exif} + {MakerApple} Nummern-Tags.
+                NSDictionary *exif    = sf_build_exif();
+                int     iso           = atomic_load_explicit(&g_lastISO,     memory_order_relaxed);
+                double  exposure      = atomic_load_explicit(&g_lastExposure,memory_order_relaxed);
+                double  fnum          = atomic_load_explicit(&g_cfgFNumber,  memory_order_relaxed);
                 if (exposure < 0.0005) exposure = 0.0005;
-                NSDictionary *maker = sf_build_maker(exposure);
+
+                NSDictionary *maker = sf_build_maker(iso, exposure, fnum);
                 NSDictionary *meta = @{ SF_EXIF_DICT_KEY : exif,
                                         @"{MakerApple}"    : maker };
 
@@ -452,8 +558,7 @@ static void sf_update_pts(CMSampleBufferRef buf) {
 %end
 
 // ============================================================================
-// %ctor: Defaults setzen, Lese-Sonde starten, Profil laden, Status-Server
-// starten. Reihenfolge bewusst: erst Sonde+Profil (einmalig), dann Server.
+// %ctor
 // ============================================================================
 %ctor {
     uint32_t seed = (uint32_t)(mach_absolute_time() & 0xFFFFFFFFU);
@@ -462,22 +567,20 @@ static void sf_update_pts(CMSampleBufferRef buf) {
 
     snprintf(g_cfgLens, sizeof(g_cfgLens), "%s", "");
 
-    // Lese-Sonde: vorhandene Dateien? Sonde misst Lesbarkeit in mediaserverd.
+    // Lese-Sonde.
     sf_probe_path("/var/mobile/Documents/sensorforge_profile.txt",
                   &g_probeTxt, &g_probeTxtErrno);
     sf_probe_path("/var/mobile/Documents/sensorforge_profile.jpg",
                   &g_probeJpg, &g_probeJpgErrno);
-    sf_probe_path("/var/tmp/sensorforge_profile.txt",
-                  &g_probeVartmp, &g_probeVartmpErrno);
 
     // Profil laden (falls lesbar) — ueberschreibt die Defaults.
     sf_load_profile("/var/mobile/Documents/sensorforge_profile.txt");
 
-    // Status-Server auf Utility-Queue (blockiert nie den Hauptpfad).
+    // Status-Server auf Utility-Queue.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sf_status_runloop();
     });
 
-    NSLog(@"[SensorForgePro] v1.3 loaded in %@ — status port %d (read+commands, Exif+MakerApple, random-walk)",
-          [[NSProcessInfo processInfo] processName], SF_STATUS_PORT);
+    NSLog(@"[SensorForgePro] v1.4 loaded in %@ — ISP-Signatur (Lux/ispDGain/DigitalFlash/LensPos) + keys?-Abgleich",
+          [[NSProcessInfo processInfo] processName]);
 }
