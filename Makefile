@@ -27,6 +27,6 @@ TWEAK_NAME = SensorForgePro
 SensorForgePro_FILES = Tweak.x
 SensorForgePro_CFLAGS = -fobjc-arc
 SensorForgePro_FRAMEWORKS = Foundation ImageIO CoreMedia CoreVideo
-SensorForgePro_FILTER_FILES = Tweak.plist
+SensorForgePro_FILTER_FILES = SensorForgePro.plist
 
 include $(THEOS_MAKE_PATH)/tweak.mk
