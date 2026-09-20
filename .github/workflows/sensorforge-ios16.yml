@@ -1,0 +1,31 @@
+name: Build SensorForge Pro
+
+on:
+  push:
+    branches: [ "main", "sensorforge" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: waruhachi/theos-action@v2.4.6
+        with:
+          theos-src: 'roothide/theos'
+          theos-branch: 'master'
+          sdks-src: 'theos/sdks'
+          sdks-branch: 'master'
+          libgcuniversal: false
+          altlist: false
+      - name: Info
+        run: |
+          ls -la
+          cat control
+      - name: Build
+        run: make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sensorforgepro-roothide-deb
+          path: packages/*.deb
+          if-no-files-found: error

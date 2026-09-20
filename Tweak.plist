@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Filter</key>
+	<dict>
+		<!-- mediaserverd (iOS 16) ist der Capture-Daemon: BW-Node-Graph + FigCapture.
+		     Nur hier injizieren; KEINE Bundles (mediaserverd hat keine Bundle-ID). -->
+		<key>Executables</key>
+		<array>
+			<string>mediaserverd</string>
+		</array>
+		<!-- Processes ist das Legacy-Aequivalent fuer aeltere FineLoader/Substrate-Filter. -->
+		<key>Processes</key>
+		<array>
+			<string>mediaserverd</string>
+		</array>
+		<key>Mode</key>
+		<string>Any</string>
+	</dict>
+</dict>
+</plist>
