@@ -27,6 +27,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 
 DEFAULT_PORT = 8797
 DEFAULT_HOST = "127.0.0.1"
@@ -210,9 +211,84 @@ def video_luma_stats(path, framecap):
 
 
 def estimate_iso_from_luma(luma):
-    lux = max(luma * 1000.0, 1.0)          # 0..255 -> Lux-Skala
+    # Luma 0..255 -> Lux-Skala: typische Innenraumszenen liegen bei
+    # ~100-1000 lux. Der Daemon rechnet fotometrisch weiter
+    # (Lux=250*F^2/(ISO*t)); hier nur eine vernuenftige Bandbreiten-
+    # Uebertragung, keine Doppelrechnung.
+    lux = max(luma * 4.0, 1.0)           # 0..255 -> 0..1020 lux
     iso = 120000.0 / (lux + 1.0)
     return int(min(max(iso, 50), 3200))
+
+
+def continuous_mode(args):
+    """Dauermodus: Video fortlaufend analysieren, alle ~1s Luma -> ISO/Exposure
+    an den Port senden. Optional: eigenes Lux-Grundniveau ('--lux').
+    Eigenmischung wie ein echter AEC-Loop:
+      lux_frame = ALPHA*lux_neu + (1-ALPHA)*lux_alt  (Traegheit)
+      exposure  = Basis 1/30s * (1 + Move), gedeckelt auf [1/60, 1/15]
+      iso       = clamp(120000/(lux+1), 50, 3200)
+    """
+    import time as _t
+    ALPHA = 0.35           # Glaettungsfaktor (AEC-Traegheit)
+    exp_base = args.exposure if args.exposure is not None else 0.033
+    fnum = args.fnumber if args.fnumber is not None else 1.8
+    lens = args.lens
+    lux_override = args.lux
+    committed_lux = None   # geglaetteter Lux-Wert
+    iso = None
+
+    # Ein ffmpeg-Durchlauf alle frame_delay Sekunden (nur der Weg, der am
+    # File arbeitet - kein Respawn der Quelle noetig).
+    pos = time.monotonic()
+    while True:
+        try:
+            luma = video_luma_stats(args.video, args.framecap)
+            if luma is not None:
+                lux_new = luma * 4.0          # konsistent zur estimate-Funktion
+                if committed_lux is None:
+                    committed_lux = lux_new
+                committed_lux = ALPHA * lux_new + (1 - ALPHA) * committed_lux
+                # ISO nur uebernehmen, wenn wir nicht explizit einen Wert
+                # festhalten sollen.
+                if iso is None:
+                    iso = int(min(max(120000.0 / (committed_lux + 1.0), 50), 3200))
+            else:
+                print("[warn] Luma-Messung fehlgeschlagen, Werte halten",
+                      flush=True)
+        except Exception as e:
+            print("[warn] Analyse-Fehler:", e, flush=True)
+
+        # Belichtungs-Move (kleiner Random-Walk um die Basis herum)
+        # + Lux senden, falls wir ihn explizit uebergeben haben
+        move = (committed_lux or 20000.0) / 20000.0
+        exp = exp_base * (1.0 + (move - 1.0) * 0.15)
+        exp = min(max(exp, 1.0 / 60.0), 1.0 / 15.0)
+
+        cmds = []
+        if iso is not None:
+            cmds.append("iso=%d" % iso)
+        cmds.append("exposure=%.5f" % exp)
+        if fnum is not None:
+            cmds.append("fnumber=%.2f" % fnum)
+        if lux_override is not None:
+            cmds.append("lux=%.1f" % lux_override)
+        elif committed_lux is not None:
+            cmds.append("lux=%.1f" % committed_lux)
+        if lens is not None:
+            cmds.append("lens=%s" % lens.replace(" ", "_"))
+
+        try:
+            resp = send_commands(args.host, args.port, cmds)
+            print(f"[{_t.strftime('%H:%M:%S')}] iso={iso} exp={exp:.4f} lux={committed_lux:.1f} | {resp[:90]}",
+                  flush=True)
+        except OSError as e:
+            print(f"[{_t.strftime('%H:%M:%S')}] SEND-FEHLER {e} — skip", flush=True)
+
+        # 1s-Intervall
+        now = _t.monotonic()
+        delay = max(0.2, 1.0 - (now - pos))
+        pos = now
+        _t.sleep(delay)
 
 
 def send_commands(host, port, commands):
@@ -227,6 +303,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", help="Bild (JPEG/HEIC) mit EXIF")
     ap.add_argument("--video", help="Video (ffmpeg analysiert Luma)")
+    ap.add_argument("--continuous", action="store_true",
+                    help="Dauermodus: Video alle ~1s analysieren + senden")
     ap.add_argument("--framecap", type=int, default=10,
                     help="ffmpeg waehlt Frame ~framecap//2 (default 10)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -237,6 +315,11 @@ def main():
     ap.add_argument("--lux", type=float, default=None)
     ap.add_argument("--lens", default=None)
     args = ap.parse_args()
+
+    if args.continuous:
+        if not args.video:
+            ap.error("--continuous erfordert --video")
+        return continuous_mode(args)
 
     if not args.image and not args.video:
         ap.error("--image ODER --video erforderlich")
