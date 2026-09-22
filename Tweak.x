@@ -278,7 +278,7 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.6 "
+        "sforge=1 ver=1.7 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
         "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
@@ -586,6 +586,116 @@ static void sf_update_pts(CMSampleBufferRef buf) {
 }
 
 // ============================================================================
+// v1.7 — App-seitiger Foto-EXIF-Path.
+// ----------------------------------------------------------------------------
+// WARUM: Der Daemon-Pfad deckt VIDEO ab. Der FOTO-Pfad liest die Frame-
+// Attachments NICHT: BWPhotoEncoderNode baut das HEIC-EXIF aus
+// AVCapturePhotoSettings.metadata DER APP. Unsere Daemon-Werte erreichen
+// Fotos also nie — genau der NikeCam-Befund (geräte-verifiziert).
+// FIX: Der Tweak hookt hier den Getter -[AVCapturePhotoSettings metadata]
+// im APP-Prozess und befuellt "{Exif}" aus den LIVE-Werten, die er ueber
+// den Loopback-Status-Port 8797 vom Daemon holt (ein Connect pro Foto,
+// sandbox-freundlich, App->Loopback ist generell erlaubt).
+// ============================================================================
+
+static int sf_port_client(char *out, size_t outsz) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in addr = {0};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(SF_STATUS_PORT);
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    ssize_t n = recv(fd, out, outsz - 1, 0);
+    close(fd);
+    if (n <= 0) return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+static void sf_parse_kv(const char *line, const char *key, char *val, size_t valsz) {
+    val[0] = '\0';
+    size_t klen = strlen(key);
+    const char *p = line;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char *v = p + klen + 1;
+            const char *end = v;
+            while (*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') end++;
+            size_t len = (size_t)(end - v);
+            if (len >= valsz) len = valsz - 1;
+            memcpy(val, v, len);
+            val[len] = '\0';
+            return;
+        }
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+}
+
+// Foto-EXIF aus den Daemon-Werten bauen (gleiche Quelle wie der Video-Pfad:
+// was am Port als cfgIso/cfgExposure/cfgFNumber/lens steht).
+static NSDictionary *sf_build_photo_exif(void) {
+    char line[512];
+    if (sf_port_client(line, sizeof(line)) != 0) return nil;
+
+    char isoBuf[8], expBuf[16], fnBuf[8], lensBuf[72];
+    sf_parse_kv(line, "cfgIso",      isoBuf,  sizeof(isoBuf));
+    sf_parse_kv(line, "cfgExposure", expBuf,  sizeof(expBuf));
+    sf_parse_kv(line, "cfgFNumber",  fnBuf,   sizeof(fnBuf));
+    sf_parse_kv(line, "lens",        lensBuf, sizeof(lensBuf));
+
+    double iso = atof(isoBuf); if (iso < 25.0)  iso = SF_ISO_BASE;
+    double exp = atof(expBuf); if (exp <= 0.0)  exp = SF_EXPOSURE_BASE_S;
+    double fn  = atof(fnBuf);  if (fn <= 0.0)   fn = 1.8;
+
+    NSMutableDictionary *exif = [NSMutableDictionary dictionaryWithCapacity:5];
+    [exif setObject:@(fn)
+             forKey:(NSString *)kCGImagePropertyExifFNumber];
+    [exif setObject:@[ @((int)llround(iso)) ]
+             forKey:(NSString *)kCGImagePropertyExifISOSpeedRatings];
+    [exif setObject:@(exp)
+             forKey:(NSString *)kCGImagePropertyExifExposureTime];
+    NSString *lens = [[NSString stringWithUTF8String:lensBuf]
+                      stringByReplacingOccurrencesOfString:@"_"
+                      withString:@" "];
+    [exif setObject:(lens.length > 0 ? lens : SF_EXIF_LENS_MODEL)
+             forKey:(NSString *)kCGImagePropertyExifLensModel];
+    [exif setObject:sf_exif_timestamp()
+             forKey:(NSString *)kCGImagePropertyExifDateTimeOriginal];
+    return exif;
+}
+
+// ============================================================================
+// HOOK — Foto-Metadaten im APP-Prozess.
+// Passthrough-Regel wie ueberall: existiert bereits ein valides {Exif},
+// fassen wir es nicht an (Apps/Tweaks mit eigenen EXIF-Daten bleiben safe).
+// ============================================================================
+%hook AVCapturePhotoSettings
+- (NSDictionary *)metadata {
+    NSDictionary *orig = %orig;
+
+    // valide {Exif} bereits vorhanden => Passthrough.
+    if (orig != nil && sf_metadata_is_valid(orig)) return orig;
+
+    NSDictionary *photoExif = sf_build_photo_exif();
+    if (photoExif == nil) return orig;   // Daemon nicht erreichbar -> Original
+
+    if (orig == nil) {
+        return @{ SF_EXIF_DICT_KEY : photoExif };
+    }
+    NSMutableDictionary *m = [orig mutableCopy];
+    [m setObject:photoExif forKey:SF_EXIF_DICT_KEY];
+    return m;
+}
+%end
+
+// ============================================================================
 // HOOK — maximale Downstream-Stufe (BWNodeOutput emitSampleBuffer:).
 // Logos-Pitfall: id in der Signatur, CMSampleBufferRef erst im Body.
 // ============================================================================
@@ -627,7 +737,9 @@ static void sf_update_pts(CMSampleBufferRef buf) {
 %end
 
 // ============================================================================
-// %ctor
+// %ctor — Prozessintern differenzieren:
+//   mediaserverd: Status-Server + Daemon-Hooks (Video-Pfad)
+//   alle anderen: App-Hook (Foto-EXIF ueber Port-Client), KEIN Bind.
 // ============================================================================
 %ctor {
     uint32_t seed = (uint32_t)(mach_absolute_time() & 0xFFFFFFFFU);
@@ -636,20 +748,24 @@ static void sf_update_pts(CMSampleBufferRef buf) {
 
     snprintf(g_cfgLens, sizeof(g_cfgLens), "%s", "");
 
-    // Lese-Sonde.
-    sf_probe_path("/var/mobile/Documents/sensorforge_profile.txt",
-                  &g_probeTxt, &g_probeTxtErrno);
-    sf_probe_path("/var/mobile/Documents/sensorforge_profile.jpg",
-                  &g_probeJpg, &g_probeJpgErrno);
+    BOOL isDaemon = [[[NSProcessInfo processInfo] processName]
+                     isEqualToString:@"mediaserverd"];
 
-    // Profil laden (falls lesbar) — ueberschreibt die Defaults.
-    sf_load_profile("/var/mobile/Documents/sensorforge_profile.txt");
+    if (isDaemon) {
+        // Lese-Sonde + Profil nur im Daemon.
+        sf_probe_path("/var/mobile/Documents/sensorforge_profile.txt",
+                      &g_probeTxt, &g_probeTxtErrno);
+        sf_probe_path("/var/mobile/Documents/sensorforge_profile.jpg",
+                      &g_probeJpg, &g_probeJpgErrno);
+        sf_load_profile("/var/mobile/Documents/sensorforge_profile.txt");
 
-    // Status-Server auf Utility-Queue.
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        sf_status_runloop();
-    });
+        // Status-Server auf Utility-Queue.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            sf_status_runloop();
+        });
+    }
 
-    NSLog(@"[SensorForgePro] v1.4 loaded in %@ — ISP-Signatur (Lux/ispDGain/DigitalFlash/LensPos) + keys?-Abgleich",
-          [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[SensorForgePro] v1.7 loaded in %@ (%s) — Daemon=Video-ISP, App=Foto-EXIF",
+          [[NSProcessInfo processInfo] processName],
+          isDaemon ? "daemon" : "app");
 }

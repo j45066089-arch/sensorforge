@@ -10,10 +10,18 @@
 		<array>
 			<string>mediaserverd</string>
 		</array>
-		<!-- Processes ist das Legacy-Aequivalent fuer aeltere FineLoader/Substrate-Filter. -->
+		<!-- Processes  ist das Legacy-Aequivalent fuer aeltere FineLoader/Substrate-Filter. -->
 		<key>Processes</key>
 		<array>
 			<string>mediaserverd</string>
+		</array>
+		<!-- App-Pfad: Foto-EXIF wird von BWPhotoEncoderNode aus
+		     AVCapturePhotoSettings.metadata DER APP gebaut — Frame-Attachments
+		     erreichen Fotos nicht. Deshalb in der Kamera-App (und erweiterbar
+		     um jede Foto-App-Bundle-ID) injizieren. -->
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.camera</string>
 		</array>
 		<key>Mode</key>
 		<string>Any</string>
