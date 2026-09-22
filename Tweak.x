@@ -283,7 +283,7 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.8 "
+        "sforge=1 ver=1.9 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
         "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
@@ -701,6 +701,36 @@ static NSDictionary *sf_build_photo_exif(void) {
     NSMutableDictionary *m = [orig mutableCopy];
     [m setObject:photoExif forKey:SF_EXIF_DICT_KEY];
     return m;
+}
+%end
+
+// ============================================================================
+// v1.8 — Call-Site-Hook. Der Getter oben reicht nicht, wenn die App die
+// Metadaten intern haelt (Swift-Kamera kennt den Getter-Pfad nicht).
+// Deshalb zusaetzlich an der beauftragenden Stelle: die Settings direkt
+// manipulieren, BEVOR der Capture startet. Das ist der NikeCam-verifizierte
+// Weg (dort: capturePhotoWithSettings:delegate:) — Proven am Geraet.
+// ============================================================================
+static void sf_attach_exif_to_settings(id settings, NSDictionary *exif) {
+    if (settings == nil || exif == nil) return;
+    @try {
+        [settings setValue:exif forKeyPath:@"photoSettings.metadata.{\"Exif\"}"];
+    } @catch (NSException *e) {
+        // KeyPath nicht vorhanden: still abwarten (nicht crashfuell).
+    }
+    @try {
+        [settings setValue:exif forKey:@"metadata"];
+    } @catch (NSException *e) {
+    }
+}
+
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithSettings:(id)settings delegate:(id)delegate {
+    NSDictionary *photoExif = sf_build_photo_exif();
+    if (photoExif != nil) {
+        sf_attach_exif_to_settings(settings, @{ SF_EXIF_DICT_KEY : photoExif });
+    }
+    %orig;
 }
 %end
 
