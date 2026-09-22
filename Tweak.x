@@ -92,6 +92,8 @@ static _Atomic(uint32_t) g_emitCount  = 0;
 static _Atomic(uint32_t) g_synthCount = 0;
 static _Atomic(uint32_t) g_passCount  = 0;
 static _Atomic(uint32_t) g_ptsCount   = 0;
+static _Atomic(uint32_t) g_photoHook  = 0;  // v1.7: Foto-EXIF-Hook-Aufrufe (APP)
+static _Atomic(uint32_t) g_appFetch   = 0;  // v1.8: App-Foto-Fetches am Port
 
 // --- Lese-Sonde --------------------------------------------------------------
 static _Atomic(int) g_probeTxt       = -1;
@@ -235,6 +237,9 @@ static void sf_handle_command(const char *cmd) {
     if (strstr(buf, "keys?") != NULL) {
         atomic_store_explicit(&g_wantKeys, 1, memory_order_relaxed);
     }
+    if (strstr(buf, "appfoto") != NULL) {
+        atomic_fetch_add_explicit(&g_appFetch, 1, memory_order_relaxed);
+    }
 
     char *save = NULL;
     for (char *tok = strtok_r(buf, " \t\r\n,", &save);
@@ -278,12 +283,12 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.7 "
+        "sforge=1 ver=1.8 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
         "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
         "walkIso=%d walkExposure=%.4f lux=%.1f lensPos=%.3f "
-        "flash=%d dump=%d\n",
+        "flash=%d dump=%d appFetch=%u\n",
         (unsigned)atomic_load_explicit(&g_emitCount,  memory_order_relaxed),
         (unsigned)atomic_load_explicit(&g_synthCount, memory_order_relaxed),
         (unsigned)atomic_load_explicit(&g_passCount,  memory_order_relaxed),
@@ -301,7 +306,8 @@ static void sf_build_status_line(char *out, size_t outsz) {
         atomic_load_explicit(&g_lastLux,      memory_order_relaxed),
         atomic_load_explicit(&g_lastLensPos,  memory_order_relaxed),
         atomic_load_explicit(&g_cfgFlash,     memory_order_relaxed),
-        atomic_load_explicit(&g_hasDump,      memory_order_relaxed));
+        atomic_load_explicit(&g_hasDump,      memory_order_relaxed),
+        (unsigned)atomic_load_explicit(&g_appFetch, memory_order_relaxed));
 }
 
 static void sf_status_runloop(void) {
@@ -611,6 +617,8 @@ static int sf_port_client(char *out, size_t outsz) {
         close(fd);
         return -1;
     }
+    // Marker: der Daemon zaehlt App-Foto-Fetches (Diagnose des Foto-Pfads).
+    (void)send(fd, "appfoto\n", 8, 0);
     ssize_t n = recv(fd, out, outsz - 1, 0);
     close(fd);
     if (n <= 0) return -1;
@@ -678,6 +686,7 @@ static NSDictionary *sf_build_photo_exif(void) {
 // ============================================================================
 %hook AVCapturePhotoSettings
 - (NSDictionary *)metadata {
+    atomic_fetch_add_explicit(&g_photoHook, 1, memory_order_relaxed);
     NSDictionary *orig = %orig;
 
     // valide {Exif} bereits vorhanden => Passthrough.
@@ -765,7 +774,7 @@ static NSDictionary *sf_build_photo_exif(void) {
         });
     }
 
-    NSLog(@"[SensorForgePro] v1.7 loaded in %@ (%s) — Daemon=Video-ISP, App=Foto-EXIF",
+    NSLog(@"[SensorForgePro] v1.8 loaded in %@ (%s) — Daemon=Video-ISP, App=Foto-EXIF",
           [[NSProcessInfo processInfo] processName],
           isDaemon ? "daemon" : "app");
 }
