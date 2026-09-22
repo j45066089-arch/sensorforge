@@ -155,6 +155,89 @@ class ContinuousController:
                 time.sleep(0.1)
 
 
+# ---------------------------------------------------------------------------
+# LordVCAM-Sync: pollt das LordVCAM-Dashboard (localhost:8080) auf die
+# aktive Quelle (video_path) und generiert fuer die GERADE GEWAEHLTE Datei
+# die Sensorwerte (Luma->ISO/Exposure/Lux) -> Tweak-Port 8797.
+# ---------------------------------------------------------------------------
+class LordVCAMSync:
+    def __init__(self, lvcam_url="http://localhost:8080"):
+        self.lvcam_url = lvcam_url
+        self.lock = threading.Lock()
+        self.thread = None
+        self.stop_flag = False
+        self.current_file = None
+        self.last = {"file": None, "iso": None, "exp": None, "lux": None}
+        self.enabled = False
+
+    def start(self):
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return "laeuft bereits"
+            self.stop_flag = False
+            self.enabled = True
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+            return "gestartet"
+
+    def stop(self):
+        with self.lock:
+            self.stop_flag = True
+            self.enabled = False
+            self.thread = None
+        return "gestoppt"
+
+    def _get_lvcam_config(self):
+        try:
+            import urllib.request
+            req = urllib.request.urlopen(self.lvcam_url + "/api/config", timeout=3)
+            return json.loads(req.read().decode(errors="replace"))
+        except Exception:
+            return None
+
+    def _analyze(self, path):
+        """Datei analysieren: Bild vs Video -> Luma -> ISO/Exp/Lux."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".png", ".jpg", ".jpeg", ".heic", ".webp"):
+            luma = image_luma_stats(path)
+        else:
+            luma = video_luma_stats(path)
+        if luma is None:
+            return None
+        lux = max(luma * 4.0, 1.0)
+        iso = int(min(max(120000.0 / (lux + 1.0), 50), 3200))
+        exp = 0.033 * (1.0 + (lux / 20000.0 - 1.0) * 0.15)
+        exp = min(max(exp, 1.0 / 60.0), 1.0 / 15.0)
+        return {"iso": iso, "exp": round(exp, 5), "lux": round(lux, 1)}
+
+    def _run(self):
+        while not self.stop_flag:
+            cfg = self._get_lvcam_config()
+            if cfg is None:
+                self.last["file"] = None
+            else:
+                vp = cfg.get("video_path")
+                st = cfg.get("source_type")
+                # Nur 'file'-Quellen analysieren (OBS/Kamera haben keine Datei)
+                if vp and st == "file" and vp != self.current_file:
+                    self.current_file = vp
+                    vals = self._analyze(vp)
+                    if vals:
+                        cmds = ["iso=%d" % vals["iso"],
+                                "exposure=%.5f" % vals["exp"],
+                                "lux=%.1f" % vals["lux"]]
+                        tweak_roundtrip(" ".join(cmds))
+                        self.last = {"file": vp, **vals}
+                # periodische Nachregelung bei unveraenderter Datei (alle 10 Runden ~20s)
+                elif self.current_file and (self.stop_flag is False):
+                    pass
+            for _ in range(10):
+                if self.stop_flag:
+                    break
+                time.sleep(0.2)
+
+
+LVCAM_SYNC = LordVCAMSync()
 CONTROLLER = ContinuousController()
 
 
@@ -265,6 +348,15 @@ h2 { font-size: 14px; margin: 0 0 8px; color: #9fb2c3; text-transform: uppercase
   </div>
 
   <div class="card">
+    <h2>LordVCAM-Sync (auto: Quelle aus LordVCAM-Dashboard)</h2>
+    <div class="row">
+      <button class="btn" onclick="lvcamStart()">▶ Sync starten</button>
+      <button class="btn ghost" onclick="lvcamStop()">■ Stop</button>
+      <span id="lvcaminfo" class="mono"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Log</h2>
     <div id="log" class="mono"></div>
   </div>
@@ -294,6 +386,13 @@ async function poll(){
       vi.textContent = `Dauermodus: iso=${j.video.iso} exp=${j.video.exp} lux=${j.video.lux}`;
     } else {
       vi.textContent = "";
+    }
+    const li = $("lvcaminfo");
+    if (j.lvcam && j.lvcam.running) {
+      li.textContent = (j.lvcam.file ? ("sync: " + j.lvcam.file.split("\\").pop() + " ") : "") +
+                       `iso=${j.lvcam.iso ?? "-"} lux=${j.lvcam.lux ?? "-"}`;
+    } else {
+      li.textContent = "";
     }
     const s = $("stats");
     s.textContent = `emit=${STATUS.emit??0}  synth=${STATUS.synth??0}  pass=${STATUS.pass??0}  pts=${STATUS.pts??0}
@@ -335,6 +434,8 @@ function resetAll(){
 }
 function vidStart(){ post("/api/video/start", {video: $("vidpath").value}); }
 function vidStop(){ post("/api/video/stop"); }
+function lvcamStart(){ post("/api/lvcam/start"); }
+function lvcamStop(){ post("/api/lvcam/stop"); }
 
 async function uploadVideo(file){
   if (!file) return;
@@ -393,7 +494,9 @@ class Handler(BaseHTTPRequestHandler):
             status = parse_status_line(line)
             running = bool(CONTROLLER.thread and CONTROLLER.thread.is_alive())
             self._send(200, {"status": status,
-                             "video": {"running": running, **CONTROLLER.last}})
+                             "video": {"running": running, **CONTROLLER.last},
+                             "lvcam": {"running": LVCAM_SYNC.enabled,
+                                       **LVCAM_SYNC.last}})
         else:
             self._send(404, {"error": "not found"})
 
@@ -458,6 +561,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"msg": msg})
         elif p.path == "/api/video/stop":
             msg = CONTROLLER.stop()
+            self._send(200, {"msg": msg})
+        elif p.path == "/api/lvcam/start":
+            msg = LVCAM_SYNC.start()
+            self._send(200, {"msg": msg})
+        elif p.path == "/api/lvcam/stop":
+            msg = LVCAM_SYNC.stop()
             self._send(200, {"msg": msg})
         else:
             self._send(404, {"error": "not found"})
