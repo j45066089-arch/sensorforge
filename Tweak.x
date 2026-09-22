@@ -278,7 +278,7 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.4 "
+        "sforge=1 ver=1.5 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
         "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
