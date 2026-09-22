@@ -278,7 +278,7 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.5 "
+        "sforge=1 ver=1.6 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
         "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
@@ -468,15 +468,28 @@ static NSDictionary *sf_build_makernote(int iso, double exposure, double lux,
     double snr = 3.0 + (agc - 1.0) * 1.6 + sf_rand_range(-0.2, 0.2); // Gain -> SNR faellt
     if (snr < 0.5) snr = 0.5;
 
-    NSMutableDictionary *m = [NSMutableDictionary dictionaryWithCapacity:15];
-    [m setObject:@14 forKey:@"1"];                                       // Tag 0x0001 (Version)
-    [m setObject:@((sf_rand_u32() % 100) < 92 ? 1 : 0) forKey:@"4"];     // AEStable
-    [m setObject:@((int)llround(lux * 0.8)) forKey:@"5"];                // AETarget
-    [m setObject:@((int)sf_rand_range(110.0, 190.0)) forKey:@"6"];       // AEAverage
-    [m setObject:@1 forKey:@"7"];                                        // AFStable
+    // Beschleunigungsvektor (0x0008): kleine, glaubwuerdige XY-Werte in g;
+    // Z ~ 1.0 (Gravitation, Geraet steht aufrecht). Naturgetreu schwankend.
+    double ax = sf_rand_range(-0.06, 0.06);
+    double ay = sf_rand_range(-0.06, 0.06);
+    double az = 0.98 + sf_rand_range(-0.03, 0.03);
+
+    NSMutableDictionary *m = [NSMutableDictionary dictionaryWithCapacity:20];
+    [m setObject:@14 forKey:@"1"];                                       // 0x0001 MakerNoteVersion
+    [m setObject:@((sf_rand_u32() % 100) < 92 ? 1 : 0) forKey:@"4"];     // 0x0004 AEStable
+    [m setObject:@((int)llround(lux * 0.8)) forKey:@"5"];                // 0x0005 AETarget
+    [m setObject:@((int)sf_rand_range(110.0, 190.0)) forKey:@"6"];       // 0x0006 AEAverage
+    [m setObject:@1 forKey:@"7"];                                        // 0x0007 AFStable
+    [m setObject:@[@(ax), @(ay), @(az)] forKey:@"8"];                    // 0x0008 AccelerationVector
+    [m setObject:@3 forKey:@"10"];                                       // 0x000a HDRImageType (3=HDR)
     [m setObject:@10 forKey:@"20"];                                      // 0x0014 ImageCaptureType=10
     [m setObject:@0 forKey:@"23"];                                       // 0x0017 LivePhotoVideoIndex
     [m setObject:@((double)sf_rand_range(0.20, 0.35)) forKey:@"29"];     // 0x001d LuminanceNoiseAmplitude
+    [m setObject:@((double)sf_rand_range(1.5, 3.0)) forKey:@"33"];       // 0x0021 HDRHeadroom
+    [m setObject:@[@((int)sf_rand_range(88, 100)),
+                   @((int)sf_rand_range(88, 100))] forKey:@"35"];        // 0x0023 AFPerformance[2]
+    [m setObject:@((int)sf_rand_range(0, 4)) forKey:@"37"];             // 0x0025 SceneFlags
+    [m setObject:@1 forKey:@"38"];                                       // 0x0026 SignalToNoiseRatioType
     [m setObject:@(snr) forKey:@"39"];                                   // 0x0027 SignalToNoiseRatio
     [m setObject:@((int)sf_rand_range(55, 70)) forKey:@"44"];            // 0x002c DeviceUserDistance
     [m setObject:@((int)sf_rand_range(4700, 5200)) forKey:@"45"];        // 0x002d ColorTemperature
