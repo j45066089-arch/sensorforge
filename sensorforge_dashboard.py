@@ -17,6 +17,7 @@ API:
   POST /api/video/stop                 -> Thread stoppen
 """
 import json
+import os
 import re
 import socket
 import subprocess
@@ -27,6 +28,8 @@ from urllib.parse import urlparse, parse_qs
 
 TARGET_HOST = "127.0.0.1"
 TARGET_PORT = 8797
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Tweak-Status lesen / Kommandos senden
@@ -70,6 +73,22 @@ def video_luma_stats(video, framecap=10):
     ]
     try:
         raw = subprocess.run(cmd, capture_output=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not raw:
+        return None
+    return sum(raw) / len(raw)
+
+
+def image_luma_stats(image):
+    """Mittlere Y-Luminanz eines Bildes (JPEG/PNG/HEIC via ffmpeg)."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", image, "-frames:v", "1",
+        "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=30).stdout
     except (OSError, subprocess.TimeoutExpired):
         return None
     if not raw:
@@ -224,11 +243,24 @@ h2 { font-size: 14px; margin: 0 0 8px; color: #9fb2c3; text-transform: uppercase
     <div class="row" style="margin-bottom:12px;">
       <span class="lbl">Video-Datei</span>
       <input type="text" id="vidpath" placeholder="C:\\Pfad\\zu\\clip.mp4" style="flex:1;">
+      <input type="file" id="vidfile" accept="video/*" style="display:none;"
+             onchange="uploadVideo(this.files[0])">
+      <button class="btn" onclick="$('vidfile').click()">📁 Auswählen</button>
     </div>
     <div class="row">
       <button class="btn" onclick="vidStart()">Start</button>
       <button class="btn ghost" onclick="vidStop()">Stop</button>
       <span id="vidinfo" class="mono"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Bild-EXIF übernehmen</h2>
+    <div class="row">
+      <input type="file" id="imgfile" accept="image/*" style="display:none;"
+             onchange="uploadImage(this.files[0])">
+      <button class="btn" onclick="$('imgfile').click()">🖼 Bild auswählen (EXIF → Tweak)</button>
+      <span id="imginfo" class="mono"></span>
     </div>
   </div>
 
@@ -304,6 +336,33 @@ function resetAll(){
 function vidStart(){ post("/api/video/start", {video: $("vidpath").value}); }
 function vidStop(){ post("/api/video/stop"); }
 
+async function uploadVideo(file){
+  if (!file) return;
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch("/api/upload/video", {method:"POST", body: fd});
+    const j = await r.json();
+    $("vidpath").value = j.file || "";
+    $("vidinfo").textContent = "hochgeladen: " + (j.file||"") ;
+    log("Video hochgeladen: " + j.file + " -> " + (j.msg||""));
+  } catch(e){ log("Upload-FEHLER: " + e); }
+}
+
+async function uploadImage(file){
+  if (!file) return;
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch("/api/upload/image", {method:"POST", body: fd});
+    const j = await r.json();
+    const gen = (j.exif && j.exif.generated) ? " (generiert aus Bildhelligkeit)" : "";
+    $("imginfo").textContent = "EXIF" + gen + ": " + JSON.stringify(j.exif||{});
+    log("Bild: " + (j.file||"") + gen + " -> " + (j.reply||""));
+    poll();
+  } catch(e){ log("Upload-FEHLER: " + e); }
+}
+
 setInterval(poll, 1000);
 poll();
 </script>
@@ -340,6 +399,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path)
+        ctype = self.headers.get("Content-Type", "")
+        # Multipart-Upload: /api/upload/video bzw /api/upload/image
+        if p.path in ("/api/upload/video", "/api/upload/image") and \
+                "multipart/form-data" in ctype:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            saved = self._save_upload(raw, ctype)
+            kind = "video" if p.path.endswith("/video") else "image"
+            if saved is None:
+                self._send(400, {"error": "keine Datei im Request"})
+                return
+            if kind == "video":
+                msg = CONTROLLER.start(saved)
+                self._send(200, {"msg": msg, "file": saved})
+            else:
+                # Bild: EXIF lesen (oder generieren), Werte an den Tweak.
+                exif = self._read_image_exif(saved)
+                cmds = []
+                if exif.get("iso"):
+                    cmds.append("iso=%d" % int(float(exif["iso"])))
+                if exif.get("exposure"):
+                    cmds.append("exposure=%.5f" % float(exif["exposure"]))
+                if exif.get("fnumber"):
+                    cmds.append("fnumber=%.2f" % float(exif["fnumber"]))
+                if exif.get("lens"):
+                    cmds.append("lens=%s" % str(exif["lens"]).replace(" ", "_"))
+                # generierte Luma -> korrelierten Lux mitsenden
+                if exif.get("luma") is not None:
+                    cmds.append("lux=%.1f" % (float(exif["luma"]) * 4.0))
+                reply = tweak_roundtrip(" ".join(cmds)) if cmds else "kein EXIF - nichts gesendet"
+                self._send(200, {"reply": reply, "exif": exif, "file": saved})
+            return
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
         try:
@@ -370,6 +461,67 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"msg": msg})
         else:
             self._send(404, {"error": "not found"})
+
+    # ------------------------------------------------------------------
+    # Upload-Helfer
+    # ------------------------------------------------------------------
+    def _save_upload(self, raw, ctype):
+        # boundary extrahieren
+        m = re.search(r"boundary=([^;]+)", ctype)
+        if not m:
+            return None
+        boundary = m.group(1).strip().strip('"').encode()
+        parts = raw.split(b"--" + boundary)
+        for part in parts:
+            if b"filename=\"" in part:
+                head, _, content = part.partition(b"\r\n\r\n")
+                fname = re.search(rb'filename="([^"]+)"', head)
+                name = fname.group(1).decode("utf-8", "replace") if fname else "upload.bin"
+                # trailing CRLF vor boundary entfernen
+                content = content.rsplit(b"\r\n", 1)[0]
+                safe = os.path.basename(name)
+                dest = os.path.join(UPLOAD_DIR, safe)
+                with open(dest, "wb") as f:
+                    f.write(content)
+                return dest
+        return None
+
+    def _read_image_exif(self, path):
+        """Bild-EXIF lesen. Wenn KEIN EXIF (z. B. KI-generierte Bilder):
+        Luma-Analyse via ffmpeg und Sensorwerte GENERIEREN
+        (ISO aus Helligkeit, Exposure-Pendel, f/1.8 iPhone-8-Default)."""
+        exif = {}
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from sensorforge_link import parse_exif_jpeg
+            exif = parse_exif_jpeg(path) or {}
+        except Exception:
+            exif = {}
+        if "_error" in exif:
+            exif = {}
+
+        # Nur als "vollstaendig" werten, wenn die Kernfelder da sind.
+        complete = ("iso" in exif and "fnumber" in exif)
+        if complete:
+            return exif
+
+        # Sonst: generieren.
+        luma = image_luma_stats(path)
+        if luma is None:
+            return {"error": "kein EXIF und Luma nicht lesbar"}
+        lux = max(luma * 4.0, 1.0)
+        iso = int(min(max(120000.0 / (lux + 1.0), 50), 3200))
+        exp = 0.033 * (1.0 + (lux / 20000.0 - 1.0) * 0.15)
+        exp = min(max(exp, 1.0 / 60.0), 1.0 / 15.0)
+        # Vorhandene Teilfelder (z. B. nur lens) beibehalten, fehlende erzeugen.
+        exif.setdefault("iso", iso)
+        exif.setdefault("exposure", round(exp, 5))
+        exif.setdefault("fnumber", 1.8)
+        exif.setdefault("lens", "iPhone 8 Back Camera")
+        exif["generated"] = True
+        exif["luma"] = round(luma, 1)
+        return exif
 
     def log_message(self, *a):
         pass
