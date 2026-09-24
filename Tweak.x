@@ -815,8 +815,9 @@ static void sf_hook_observeValue(id self, SEL _cmd, NSString *keyPath, id object
         uint64_t kn = atomic_fetch_add_explicit(&g_kvoCalls, 1, memory_order_relaxed) + 1;
         int32_t iso = sf_valid_app_iso();
         if ((kn & 0x3ff) == 1)
-            sf_app_log("KVO keyPath=%@ obj=%@ change=%@ isoAvail=%d\n",
-                       keyPath, [object class] ?: @"?", change, iso);
+            sf_app_log("KVO keyPath=%@ obj=%s change=%@ isoAvail=%d\n",
+                       keyPath, object ? class_getName(object_getClass(object)) : "nil",
+                       change, iso);
         if (iso > 0 && change[NSKeyValueChangeNewKey]) {
             NSMutableDictionary *mut = [change mutableCopy];
             mut[NSKeyValueChangeNewKey] = @((float)iso);
