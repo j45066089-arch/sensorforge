@@ -18,10 +18,15 @@
 		<!-- App-Pfad: Foto-EXIF wird von BWPhotoEncoderNode aus
 		     AVCapturePhotoSettings.metadata DER APP gebaut — Frame-Attachments
 		     erreichen Fotos nicht. Deshalb in der Kamera-App (und erweiterbar
-		     um jede Foto-App-Bundle-ID) injizieren. -->
+		     um jede Foto-App-Bundle-ID) injizieren. ProCamera liest seine
+		     LIVE-ISO ueber eigene CCMedia-Wrapper/KVO/Notifications —
+		     deshalb ist com.cocologics.ProCamera hier explizit gelistet. -->
 		<key>Bundles</key>
 		<array>
 			<string>com.apple.camera</string>
+			<string>com.cocologics.ProCamera</string>
+			<string>com.zhiliaoapp.musically</string>
+			<string>com.burbn.instagram</string>
 		</array>
 		<key>Mode</key>
 		<string>Any</string>

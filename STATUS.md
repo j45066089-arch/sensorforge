@@ -34,3 +34,13 @@ Stand: 2026-09-20 Abend — Maurice schläft, hier wird morgen weitergemacht.
   manuell. Sampler.py (Host) pollt 8797 alle 5s über usbmux forward.
 - lens-Werte am Port: Leerzeichen → Unterstrich (Token-Split).
 - mediaserverd-Kreisverkehr: Synth-Frames kommen im Pass-Zweig wieder vorbei.
+
+## v1.9 + Dashboard (2026-09-22)
+- Foto-EXIF-Pfad FERTIG: Call-Site-Hook capturePhotoWithSettings:delegate: am Gerät belegt
+  (Test: ISO 640, F2.8, "SF Test Lens" im HEIC-EXIF nachgewiesen). appFetch-Zähler im Status.
+- Dashboard :8081 läuft mit: Slider (ISO/Exposure/F/lux), Video-Dauermodus,
+  Bild-Upload (echte EXIF ODER Luma-Generierung für KI-Bilder), LordVCAM-Sync.
+- LordVCAM-Sync LEBENDIG: pollt localhost:8080/api/config (video_path, source_type=file),
+  analysiert Datei (Bild/Video-Luma -> ISO/Exp/Lux), sendet an Port 8797.
+- OFFEN: Exposure-Glättung im Foto (AVCapture rundet auf 1/30), Instagram/TikTok-Bundle-IDs.
+- INFO: Dashboard-Prozess als proc_71c96ea92c1a gestartet (Port 8081, :/api/*).

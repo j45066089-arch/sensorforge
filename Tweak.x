@@ -32,6 +32,8 @@
 // ============================================================================
 
 #import <Foundation/Foundation.h>
+#include <objc/runtime.h>
+#include <dlfcn.h>
 #include <CoreMedia/CoreMedia.h>
 #include <ImageIO/ImageIO.h>
 #include <mach/mach_time.h>
@@ -283,7 +285,7 @@ static const char *sf_default_lens(void) {
 
 static void sf_build_status_line(char *out, size_t outsz) {
     snprintf(out, outsz,
-        "sforge=1 ver=1.9 "
+        "sforge=1 ver=1.10 "
         "emit=%u synth=%u pass=%u pts=%u "
         "probeTxt=%d(%d) probeJpg=%d(%d) "
         "cfgIso=%.0f cfgExposure=%.4f cfgFNumber=%.2f lens=%s "
@@ -680,6 +682,171 @@ static NSDictionary *sf_build_photo_exif(void) {
 }
 
 // ============================================================================
+// v1.10 — ProCamera-ISO-Pfad (App-Prozess). NikeCam-geräte-verifizierter
+// Blueprint (VCamUSB-v2/appiso/AppIso.x): ProCamera liest die LIVE-ISO aus
+//   1) CCCameraController.ISO (Swift-KeyPath in CCMedia.framework)
+//   2) AVCaptureDevice.ISO-Getter (Float-Return -> method_setImplementation!)
+//   3) userInfo der AVCaptureDeviceSubjectAreaDidChangeNotification
+//      (Keys AVCaptureISOCurrent/ISO*)
+//   4) KVO-Change-Dictionaries (keyPath enthält "ISO")
+// NICHT über Frame-MetadataDictionary (das erreicht ProCamera nie).
+// Die App holt den Zielwert bei jedem Foto/Getter über den Loopback-Port
+// 8797 (ein Cache + 3s-Frische wie im Blueprint), KEIN Getter-IPC.
+// ============================================================================
+
+static _Atomic uint32_t g_appIsoCache = 0;    // letzter Daemon-ISO
+static _Atomic uint64_t g_appIsoAgeNs  = 0;   // Zeitstempel des Caches
+static _Atomic uint64_t g_avisoCalls   = 0;
+static _Atomic uint64_t g_cccCalls     = 0;
+static _Atomic uint64_t g_notifCalls   = 0;
+static _Atomic uint64_t g_kvoCalls     = 0;
+
+static void sf_refresh_app_iso(void) {
+    char line[512];
+    if (sf_port_client(line, sizeof(line)) != 0) return;
+    char isoBuf[16];
+    sf_parse_kv(line, "cfgIso", isoBuf, sizeof(isoBuf));
+    uint32_t iso = (uint32_t)atoi(isoBuf);
+    if (iso < 25 || iso > 3200) return;
+    atomic_store_explicit(&g_appIsoCache, iso, memory_order_relaxed);
+    atomic_store_explicit(&g_appIsoAgeNs, (uint64_t)(CFAbsoluteTimeGetCurrent()*1e9 + mach_absolute_time()),
+                          memory_order_relaxed);
+}
+
+static int32_t sf_valid_app_iso(void) {
+    uint32_t iso = atomic_load_explicit(&g_appIsoCache, memory_order_relaxed);
+    uint64_t age = atomic_load_explicit(&g_appIsoAgeNs, memory_order_relaxed);
+    uint64_t now = (uint64_t)(CFAbsoluteTimeGetCurrent()*1e9 + mach_absolute_time());
+    if (iso >= 25 && iso <= 3200 && age && (now - age) < 3000000000ULL) {
+        return (int32_t)iso;
+    }
+    return -1;
+}
+
+// --- AVCaptureDevice ISO (Float-Return: KEIN MSHookMessageEx) --------------
+static float (*sf_orig_AVISO)(id, SEL);
+static float sf_hook_AVISO(id self, SEL _cmd) {
+    atomic_fetch_add_explicit(&g_avisoCalls, 1, memory_order_relaxed);
+    int32_t iso = sf_valid_app_iso();
+    if (iso > 0) return (float)iso;
+    return sf_orig_AVISO(self, _cmd);
+}
+
+// --- CCCameraController ISO (ProCamera-Wrapper; Float-Return) --------------
+static float (*sf_orig_CCC_ISO)(id, SEL);
+static float sf_hook_CCC_ISO(id self, SEL _cmd) {
+    atomic_fetch_add_explicit(&g_cccCalls, 1, memory_order_relaxed);
+    int32_t iso = sf_valid_app_iso();
+    if (iso > 0) return (float)iso;
+    return sf_orig_CCC_ISO(self, _cmd);
+}
+
+// --- Notification: userInfo-ISO fälschen -----------------------------------
+static void (*sf_orig_postNotification)(id, SEL, NSNotification *);
+static void sf_hook_postNotification(id self, SEL _cmd, NSNotification *note) {
+    if ([note.name isEqualToString:@"AVCaptureDeviceSubjectAreaDidChangeNotification"]) {
+        atomic_fetch_add_explicit(&g_notifCalls, 1, memory_order_relaxed);
+        int32_t iso = sf_valid_app_iso();
+        NSDictionary *ui = note.userInfo;
+        if (iso > 0 && ui.count) {
+            BOOL changed = NO;
+            NSMutableDictionary *mut = [ui mutableCopy];
+            for (NSString *k in [ui allKeys]) {
+                if ([k rangeOfString:@"ISO" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    mut[k] = @((float)iso);
+                    changed = YES;
+                }
+            }
+            if (changed) {
+                note = [NSNotification notificationWithName:note.name
+                                                    object:note.object
+                                                  userInfo:mut];
+            }
+        }
+    }
+    sf_orig_postNotification(self, _cmd, note);
+}
+
+// --- KVO: ISO-Wert im Change-Dictionary ersetzen ---------------------------
+static void (*sf_orig_observeValue)(id, SEL, NSString *, id, NSDictionary *, void *);
+static void sf_hook_observeValue(id self, SEL _cmd, NSString *keyPath, id object,
+                                 NSDictionary *change, void *context) {
+    if (keyPath && [keyPath rangeOfString:@"ISO" options:NSCaseInsensitiveSearch].location != NSNotFound
+        && change) {
+        atomic_fetch_add_explicit(&g_kvoCalls, 1, memory_order_relaxed);
+        int32_t iso = sf_valid_app_iso();
+        if (iso > 0 && change[NSKeyValueChangeNewKey]) {
+            NSMutableDictionary *mut = [change mutableCopy];
+            mut[NSKeyValueChangeNewKey] = @((float)iso);
+            change = mut;
+        }
+    }
+    sf_orig_observeValue(self, _cmd, keyPath, object, change, context);
+}
+
+// Float-Getter-Hook-Installer (method_setImplementation — propagiert sonst
+// nur x0, Floats liegen in s0).
+static void sf_install_float_hook(Class cls, const char *selname,
+                                  IMP hook, IMP *orig) {
+    if (cls == NULL || *orig != NULL) return;
+    Method m = class_getInstanceMethod(cls, sel_registerName(selname));
+    if (m == NULL) return;
+    *orig = method_getImplementation(m);
+    method_setImplementation(m, hook);
+}
+
+static void sf_install_app_iso_hooks(void) {
+    // Cache-Frischwerte vorsorglich initial laden.
+    sf_refresh_app_iso();
+
+    // CCCameraController (ProCamera-eigenes CCMedia.framework):
+    // vor dem Lookup per Bundle-Pfad laden, sonst findet NSClassFromString
+    // die Klasse nicht (dyld lazy).
+    NSString *ccPath = [[[NSBundle mainBundle] bundlePath]
+        stringByAppendingPathComponent:@"Frameworks/CCMedia.framework/CCMedia"];
+    if (access([ccPath UTF8String], F_OK) == 0) dlopen([ccPath UTF8String], RTLD_NOW);
+    NSString *uiPath = [[[NSBundle mainBundle] bundlePath]
+        stringByAppendingPathComponent:@"Frameworks/CameraUI.framework/CameraUI"];
+    if (access([uiPath UTF8String], F_OK) == 0) dlopen([uiPath UTF8String], RTLD_NOW);
+
+    Class cc = NSClassFromString(@"CCCameraController");
+    if (cc == NULL) cc = objc_getClass("CCCameraController");
+    if (cc != NULL) {
+        sf_install_float_hook(cc, "ISO", (IMP)sf_hook_CCC_ISO, (IMP *)&sf_orig_CCC_ISO);
+        sf_install_float_hook(cc, "iso", (IMP)sf_hook_CCC_ISO, (IMP *)&sf_orig_CCC_ISO);
+    }
+
+    // AVCaptureDevice-Getter (andere Apps).
+    dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_NOW);
+    Class avDev = NSClassFromString(@"AVCaptureDevice");
+    if (avDev == NULL) avDev = objc_getClass("AVCaptureDevice");
+    if (avDev != NULL) {
+        sf_install_float_hook(avDev, "ISO", (IMP)sf_hook_AVISO, (IMP *)&sf_orig_AVISO);
+    }
+
+    // KVO (allgemein, ISO-KeyPaths).
+    Method m = class_getInstanceMethod([NSObject class],
+        sel_registerName("observeValueForKeyPath:ofObject:change:context:"));
+    if (m && sf_orig_observeValue == NULL) {
+        sf_orig_observeValue = (void (*)(id, SEL, NSString *, id, NSDictionary *, void *))
+            method_getImplementation(m);
+        method_setImplementation(m, (IMP)sf_hook_observeValue);
+    }
+
+    // Notification-Center.
+    Class nc = NSClassFromString(@"NSNotificationCenter");
+    if (nc == NULL) nc = objc_getClass("NSNotificationCenter");
+    if (nc != NULL && sf_orig_postNotification == NULL) {
+        Method nm = class_getInstanceMethod(nc, sel_registerName("postNotification:"));
+        if (nm) {
+            sf_orig_postNotification = (void (*)(id, SEL, NSNotification *))
+                method_getImplementation(nm);
+            method_setImplementation(nm, (IMP)sf_hook_postNotification);
+        }
+    }
+}
+
+// ============================================================================
 // HOOK — Foto-Metadaten im APP-Prozess.
 // Passthrough-Regel wie ueberall: existiert bereits ein valides {Exif},
 // fassen wir es nicht an (Apps/Tweaks mit eigenen EXIF-Daten bleiben safe).
@@ -802,9 +969,13 @@ static void sf_attach_exif_to_settings(id settings, NSDictionary *exif) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             sf_status_runloop();
         });
+    } else {
+        // App-Prozess: ProCamera-ISO-Hooks (Getter/CCCameraController/
+        // Notification/KVO) — Port 8797 als Wertquelle.
+        sf_install_app_iso_hooks();
     }
 
-    NSLog(@"[SensorForgePro] v1.8 loaded in %@ (%s) — Daemon=Video-ISP, App=Foto-EXIF",
+    NSLog(@"[SensorForgePro] v1.10 loaded in %@ (%s) — Daemon=Video-ISP, App=Foto-EXIF+ISO-Hooks",
           [[NSProcessInfo processInfo] processName],
           isDaemon ? "daemon" : "app");
 }

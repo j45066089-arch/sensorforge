@@ -1,6 +1,6 @@
 Package: com.forge.sensorforgepro
 Name: SensorForge Pro
-Version: 1.9
+Version: 1.10
 Architecture: iphoneos-arm64
 Description: Downstream-Metadaten-Synthese fuer emulierte Kamera-Feeds (mediaserverd, iOS 16.6-16.7.16). Haengt an bestehende Video-Frames (CMSampleBufferRef) ein plausibles, dynamisches MetadataDictionary ({Exif}, ISO 195-205, ExposureTime ~0.033s) und aktualisiert die PTS per Host-Clock. Kein Pixel-Zugriff, keine Reallokation, kein Datei-IO: rein additive CMSetAttachment-Operationen. Passthrough bei bereits validen Metadaten (kollisionsfrei zu Frame-Swap-Tweaks).
 Maintainer: Maurice <shosh@localhost>
